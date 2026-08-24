@@ -40311,6 +40311,9 @@ tr808
 @source:roland/roland_tr909.cpp
 tr909
 
+@source:roland/roland_u110.cpp
+u110
+
 @source:roland/roland_u20.cpp
 u20
 u220

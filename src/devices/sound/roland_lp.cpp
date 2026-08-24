@@ -23,6 +23,8 @@
 #include "emu.h"
 #include "roland_lp.h"
 
+#include <cmath>
+
 
 DEFINE_DEVICE_TYPE(MB87419_MB87420, mb87419_mb87420_device, "mb87419_mb87420", "Roland LP MB87419/MB87420 PCM")
 
@@ -45,9 +47,10 @@ mb87419_mb87420_device::mb87419_mb87420_device(const machine_config &mconfig, co
 void mb87419_mb87420_device::device_start()
 {
 	m_clock = clock() / 2;
-	m_rate = m_clock / 512; // usually 32 KHz
+	m_rate = clock() / m_rate_div;  // 32 kHz on both the CM-32P and the U-110
 
-	m_stream = stream_alloc(0, 2, m_rate);
+	std::fill(std::begin(m_voice_mask), std::end(m_voice_mask), 0x03);
+	m_stream = stream_alloc(0, m_out_count, m_rate);
 
 	logerror("Roland PCM: Clock %u, Rate %u\n", m_clock, m_rate);
 }
@@ -231,7 +234,9 @@ void mb87419_mb87420_device::write(offs_t offset, u8 data)
 						chn.addr = chn.start;
 						offs_t addr = (chn.addr >> 14) | ((chn.bank & 0x3C00) << 8);
 						chn.smpl_cur = 0;
-						chn.smpl_nxt = decode_sample((int8_t)read_byte(addr));
+						chn.smpl_nxt = (m_pcm_mode == PCM_LINEAR8)
+								? (int16_t)(int8_t)read_byte(addr) * 16
+								: decode_sample((int8_t)read_byte(addr));  // FLOAT8 and DIFFERENTIAL both start here
 						chn.play_dir = +1;
 						logerror("Starting channel %u, bank 0x%04X, addr 0x%05X.%03X\n",
 							basechn + ch_id, chn.bank, chn.start >> 14, (chn.start & 0x3FFF) << 2);
@@ -252,6 +257,32 @@ void mb87419_mb87420_device::write(offs_t offset, u8 data)
 	}
 }
 
+// The voice volume pair is NOT a linear 16-bit magnitude.  The firmware builds it at
+// 0x69F0-0x6A59 and stores it with one `st 44, 140c`, but the two bytes are independent:
+// the low byte (reg 06) is a 7-bit level clamped to 1..0x7F, and the high byte (reg 07)
+// is loaded separately from another register.
+//
+// Register 07 is **logarithmic**.  The firmware's own conversion table at 0xAEC6 reads
+// 143, 159, 175, 191, 207, 223, 239, 255 at indices 1, 2, 4, 8, 16, 32, 64, 128 -- every
+// doubling of amplitude adds exactly 16, so the scale is 16 units per octave, i.e.
+// 6.0206/16 = 0.3763 dB per unit, full scale at 0xFF.
+//
+// Read linearly (as MAME did) a velocity sweep spanning 21.3 dB on real hardware collapses
+// to 5.3 dB.  Decoded this way the same sweep predicts -20.6 dB where hardware measures
+// -21.3 dB.  `[I]` The residual, and the role of the low byte, are still open.
+static inline uint32_t volume_gain(uint16_t vol)
+{
+	static bool init = false;
+	static uint32_t lut[256];
+	if (! init)
+	{
+		for (int i = 0; i < 256; i ++)
+			lut[i] = (uint32_t)(65535.0 * pow(2.0, (i - 255) / 16.0) + 0.5);
+		init = true;
+	}
+	return lut[(vol >> 8) & 0xFF];
+}
+
 //-------------------------------------------------
 //  sound_stream_update - handle a stream update
 //-------------------------------------------------
@@ -270,9 +301,22 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 				smp_data = sample_interpolate(chn.smpl_cur, chn.smpl_nxt, chn.addr & 0x3FFF);
 			else
 				smp_data = sample_interpolate(chn.smpl_nxt, chn.smpl_cur, chn.addr & 0x3FFF);
-			smp_data = smp_data * chn.volume;
-			stream.add_int(0, smpl, smp_data, 32768 << 14); // >>14 results in a good overall volume
-			stream.add_int(1, smpl, smp_data, 32768 << 14);
+			smp_data = smp_data * volume_gain(chn.volume);
+			if (m_out_count <= 2)
+			{
+				// historical behaviour: every voice to both channels
+				stream.add_int(0, smpl, smp_data, 32768 << 14); // >>14 results in a good overall volume
+				stream.add_int(1, smpl, smp_data, 32768 << 14);
+			}
+			else
+			{
+				// one stream per Multi Output; a voice may feed several (a centred group
+				// carries mask 0x03, i.e. Multi Outputs 1 and 2 together)
+				u8 const mask = m_voice_mask[&chn - &m_chns[0]];
+				for (int out = 0; out < m_out_count; out ++)
+					if (BIT(mask, out))
+						stream.add_int(out, smpl, smp_data, 32768 << 14);
+			}
 
 			uint32_t old_addr = chn.addr;
 			if (chn.play_dir > 0)
@@ -288,10 +332,31 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 				offs_t addr = (chn.addr >> 14) | ((chn.bank & 0x3C00) << 8);
 				//logerror("Chn %u: sample addr 0x%05X.%03X\n", &chn - &m_chns[0], chn.addr >> 14, (chn.addr & 0x3FFF) << 2);
 				chn.smpl_cur = chn.smpl_nxt;
-				chn.smpl_nxt += decode_sample((int8_t)read_byte(addr)); // This was verified to be independent from play_dir.
+				if (m_pcm_mode == PCM_FLOAT8)
+				{
+					// Sarayan's 1-3-4 rule is the correct decoder, but it is memoryless:
+					// the byte IS the sample, not a delta.  Verified against the U-110's own
+					// Sound Check tone (wave-ROM sample 212), which the firmware plays as a
+					// pure sine: read linearly the ROM data is a trapezoid with h3 at
+					// -15.3 dB, and decoded here it is a sine to 0.99975 with h3 at -66.7 dB.
+					// The decoded/ideal ratio holds constant to 2.5% over a 14:1 amplitude
+					// range, against 32% for the linear reading.  Full scale is +/-1984, so
+					// no scaling and no clamp are needed.
+					chn.smpl_nxt = decode_sample((int8_t)read_byte(addr));
+				}
+				else if (m_pcm_mode == PCM_LINEAR8)
+				{
+					// Plain two's complement 8-bit PCM.  Kept for comparison; this is NOT how
+					// the U-110 reads its wave ROM.  x16 puts a full-scale sample at +/-2048.
+					chn.smpl_nxt = (int16_t)(int8_t)read_byte(addr) * 16;
+				}
+				else
+				{
+					chn.smpl_nxt += decode_sample((int8_t)read_byte(addr)); // This was verified to be independent from play_dir.
 
-				// until the decoding is fixed, we prevent overflow bugs (due to DC offsets when looping) this way
-				chn.smpl_nxt = std::clamp<int16_t>(chn.smpl_nxt, -0x7FF, +0x7FF);
+					// until the decoding is fixed, we prevent overflow bugs (due to DC offsets when looping) this way
+					chn.smpl_nxt = std::clamp<int16_t>(chn.smpl_nxt, -0x7FF, +0x7FF);
+				}
 			}
 
 			bool reachedEnd = false;

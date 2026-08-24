@@ -422,10 +422,18 @@ void i8x9x_device::timer2_reset(u64 current_time)
 void i8x9x_device::set_hsi_state(int pin, bool state)
 {
 	if(pin == 0 && !BIT(hsi_status, 1) && state) {
-		if(BIT(ioc1, 1)) {
-			pending_irq |= IRQ_HSI0;
-			check_irq();
-		}
+		// The HSI.0 interrupt (vector 0x2008) is an independent source on this family: it
+		// fires on a rising edge of the HSI.0 pin and is enabled by INT_MASK bit 4, which
+		// check_irq() already honours.  IOC1 bit 1 selects the source of the *EXTINT*
+		// interrupt (EXTINT pin vs ACH7) and does not gate this one.
+		//
+		// The Roland U-110 shows why the distinction matters: it sets IOC1 = 0x21, leaving
+		// bit 1 clear so EXTINT is taken from the pin (driven by the MB87419 sound chip),
+		// while simultaneously enabling INT_MASK bit 4 and depending on HSI.0 from the IC8
+		// gate array to drain its LCD text queue.  Gating this on IOC1 bit 1 made the two
+		// mutually exclusive, so the queue filled and the firmware spun forever.
+		pending_irq |= IRQ_HSI0;
+		check_irq();
 		if((ioc0 & 0x28) == 0x28)
 			timer2_reset(total_cycles());
 	}

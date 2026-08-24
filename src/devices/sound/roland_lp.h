@@ -14,6 +14,21 @@ public:
 
 	auto int_callback() { return m_int_callback.bind(); }
 
+	// Sample format.  The CM-32P driver keeps the historical differential reading;
+	// the U-110's wave data is plain two's complement 8-bit PCM (see roland_u110.cpp).
+	enum pcm_mode : u8 { PCM_DIFFERENTIAL = 0, PCM_LINEAR8 = 1, PCM_FLOAT8 = 2 };
+	void set_pcm_mode(pcm_mode mode) { m_pcm_mode = mode; }
+
+	// Output routing.  The CM-32P keeps the historical 2-channel behaviour (every voice to
+	// both); the U-110 asks for 6, one per Multi Output, and supplies a per-voice output
+	// mask -- bit k enables Multi Output k+1, exactly as the BU3905's slot registers work.
+	void set_output_count(int count) { m_out_count = count; }
+	void set_voice_mask(u8 voice, u8 mask) { if (voice < NUM_CHANNELS) m_voice_mask[voice] = mask; }
+
+	// Output rate divider.  The CM-32P's 32.768 MHz / 1024 gives 32 kHz; the U-110 reaches
+	// the same 32 kHz from 34.816 MHz / 1088, measured against real hardware.
+	void set_rate_divider(u32 div) { m_rate_div = div; }
+
 	u8 read(offs_t offset);
 	void write(offs_t offset, u8 data);
 
@@ -61,7 +76,11 @@ private:
 	uint32_t m_rate;                    // sample rate (usually 32000 Hz)
 	sound_stream* m_stream;             // stream handle
 	pcm_channel m_chns[NUM_CHANNELS];   // channel memory
-	uint8_t m_sel_chn;                  // selected channel
+	uint8_t m_sel_chn;
+	pcm_mode m_pcm_mode = PCM_DIFFERENTIAL;
+	int m_out_count = 2;
+	u8 m_voice_mask[NUM_CHANNELS];
+	u32 m_rate_div = 1024;                  // selected channel
 };
 
 DECLARE_DEVICE_TYPE(MB87419_MB87420, mb87419_mb87420_device)
