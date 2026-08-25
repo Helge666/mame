@@ -256,7 +256,9 @@ private:
 	u8  m_port2 = 0;
 	u16 m_leds = 0;
 	bool m_trace_tg = true;
-	u32 m_scan = 0;         // firmware panel scans since power-on (100 Hz)
+	bool m_trace_midi_rx = true;
+	u32 m_scan = 0;                        // firmware panel scans since power-on (100 Hz)
+	bool m_mode_announced = false;
 	u8  m_stat_idx = 0;     // voice index written to sound-chip register 0x10 / 0x12
 	attotime m_voice_quiet[32];
 };
@@ -370,6 +372,29 @@ u8 roland_u110_state::switch_r(offs_t offset)
 	// Six panel switches wired to IC8's READ0-READ5 (pins 64-69), presented as one byte.
 	// There is no matrix: the firmware reads 0x1300 exactly once, at 0x4118.
 	u8 forced = 0;
+
+	// Announce the boot mode on the console, once, on the first scan.  BOOTKEYS and
+	// AUTOTEST are CONFIG ports, so MAME writes whatever they were set to into
+	// cfg/u110.cfg on exit and silently restores it next time.  A single run that
+	// enabled a service test therefore leaves every later run stuck in the test menu,
+	// where no MIDI note ever sounds -- easy to lose an hour to.  (This cannot go in
+	// machine_start: input ports cannot be read at init time.)
+	if (!m_mode_announced)
+	{
+		m_mode_announced = true;
+		u8 const at = m_autotest.read_safe(0) & 0x0f;
+		u8 const bk = m_boot_keys.read_safe(0) & 0x33;
+		if (at != 0)
+			osd_printf_info("U-110: *** SERVICE TEST MODE *** auto-navigating to test %d%s."
+					"  No MIDI notes will sound.\n", at,
+					BIT(m_autotest.read_safe(0), 4) ? ", sweeping its steps" : "");
+		else if (bk != 0)
+			osd_printf_info("U-110: *** power-on key combination 0x%02X held *** (%s)\n", bk,
+					bk == 0x30 ? "service test menu" :
+					bk == 0x03 ? "initialise memory" : "unknown");
+		else
+			osd_printf_info("U-110: normal boot (no service test).\n");
+	}
 
 	u8 const autotest = m_autotest.read_safe(0) & 0x0f;
 	bool const sweep = BIT(m_autotest.read_safe(0), 4);
@@ -731,6 +756,8 @@ TIMER_CALLBACK_MEMBER(roland_u110_state::midi_rx_cb)
 	else
 	{
 		m_maincpu->serial_w(m_rx_data);     // stop bit reached; hand the byte over
+		if (m_trace_midi_rx)
+			logerror("MIDI IN %02X\n", m_rx_data);
 		m_rx_bit = -1;
 	}
 }
@@ -938,9 +965,29 @@ void roland_u110_state::u110(machine_config &config)
 	// The U-110's wave data is plain two's complement 8-bit PCM, established by comparing
 	// decodes against the circulating ROM-dump WAVs: sample 89 matches direct PCM at
 	// r=0.76 versus 0.26 for the differential reading MAME uses for the CM-32P.
-	m_pcm->set_pcm_mode(mb87419_mb87420_device::PCM_FLOAT8);
+	// The wave ROM byte is a DELTA and the chip integrates it.  A sine's derivative is a
+	// sine, so the Sound Check tone could never have revealed this -- but it explains the
+	// 6 dB/octave the ROM sits above the U-110's output, and it makes a ping-pong loop
+	// weld itself: on the reverse pass the delta's sign flips, the accumulator retraces
+	// the waveform exactly, and the amplitude never jumps because what reverses is the
+	// SLOPE.  No de-emphasis filter is needed -- the integration is the de-emphasis.
+	m_pcm->set_pcm_mode(mb87419_mb87420_device::PCM_FLOAT8_DELTA);
+	m_pcm->set_delta_dc_hz(0.0);            // a true integrator; the loops are DC balanced
 	m_pcm->set_rate_divider(1088);
 	m_pcm->set_output_count(6);
+	// Note-off release.  The CPU writes a voice's volume once at note-on and never again,
+	// so the fade after note-off is the chip's.  Measured from listen/2 against a dry
+	// render of the same wave-ROM data (see listen/2/ENVELOPE.md): seven notes across four
+	// octaves and three velocities fall 14-30 dB in 124-252 ms, and a straight line in dB
+	// fits at R2 0.92-1.00 -- exponential, averaging 127 dB/s.
+	m_pcm->set_env_release_db_per_s(127.0);
+	// Held-note decay is left at zero deliberately.  Hardware clearly has one -- the same
+	// measurement shows 3.7-7.8 dB/s of fade that the sample data does not account for --
+	// but no register the CPU writes changes between notes that decay at different rates,
+	// and the U-110's own sysex exposes only ENV ATTACK RATE and ENV RELEASE RATE per part
+	// (0x001n0A / 0x001n0B, -7..+7), with no decay parameter at all.  Until we can source
+	// it, a fixed rate here would be a fudge that hides the error rather than fixing it.
+	m_pcm->set_env_decay_db_per_s(0.0);
 	// Six Multi Outputs, summed to the MIX pair.
 	//
 	// Pan positions measured on real hardware with service test 11, which steps the jacks in
