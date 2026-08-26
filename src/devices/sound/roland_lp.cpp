@@ -281,10 +281,9 @@ void mb87419_mb87420_device::write(offs_t offset, u8 data)
 	}
 }
 
-// The voice volume pair is NOT a linear 16-bit magnitude.  The firmware builds it at
-// 0x69F0-0x6A59 and stores it with one `st 44, 140c`, but the two bytes are independent:
-// the low byte (reg 06) is a 7-bit level clamped to 1..0x7F, and the high byte (reg 07)
-// is loaded separately from another register.
+// The voice volume pair is NOT a linear 16-bit magnitude, and it is not two levels: it is
+// an ENVELOPE SEGMENT.  Register 07 is the TARGET level and register 06 is the SIGNED ramp
+// RATE the chip uses to get there (+1..+0x7F rising, 0x80..0xFF = -128..-1 falling).
 //
 // Register 07 is **logarithmic**.  The firmware's own conversion table at 0xAEC6 reads
 // 143, 159, 175, 191, 207, 223, 239, 255 at indices 1, 2, 4, 8, 16, 32, 64, 128 -- every
@@ -293,7 +292,15 @@ void mb87419_mb87420_device::write(offs_t offset, u8 data)
 //
 // Read linearly (as MAME did) a velocity sweep spanning 21.3 dB on real hardware collapses
 // to 5.3 dB.  Decoded this way the same sweep predicts -20.6 dB where hardware measures
-// -21.3 dB.  `[I]` The residual, and the role of the low byte, are still open.
+// -21.3 dB.  `[I]` That 1.3 dB residual is still open.
+//
+// The rate byte is ignored here, and so is the whole envelope, because this device never
+// asserts m_int_callback.  On hardware the chip ramps the level and raises EXTINT when a
+// voice needs its next segment; the firmware's handler at 0x41C4 is the U-110's entire TVA
+// envelope generator (see analysis/ROM-ANALYSIS.md, "The amplitude envelope lives in the
+// CPU").  Without the interrupt every voice holds its note-on target forever -- which is
+// exactly why nothing decays.  Using only reg 07 is therefore right as far as it goes: it
+// is the level the envelope is heading to.
 static inline uint32_t volume_gain(uint16_t vol)
 {
 	static bool init = false;
