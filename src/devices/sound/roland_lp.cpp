@@ -134,14 +134,22 @@ u8 mb87419_mb87420_device::read(offs_t offset)
 		case 3:  value = (m_chns[m_status_voice].addr >> 16) & 0xFFFF; break;
 		default:                                                // select 0x16
 			{
-				// The log level, the same scale as register 07 -- what the firmware's own
-				// normalise-and-take-the-exponent at 0x7683 produces.  It lands in the HIGH
-				// byte, which is where the envelope handler reads it (0x42D0, 0x432C).
+				// Select 0x16 hands back the voice's whole current SEGMENT: the level it has
+				// reached in the high byte, on register 07's own scale (what the firmware's
+				// normalise-and-take-the-exponent at 0x7683 produces), and the rate it is
+				// running at in the low byte.
+				//
+				// The low byte matters.  The release handler at 0xBEBD reads this word,
+				// scales the rate down through 0xC0C4 (`shrab 42, #01`) and writes it back,
+				// which is how an exponential release is built out of linear segments -- and
+				// the sustain handler at 0xBE99 has to `clrb` that byte to get a rate of
+				// zero, which only makes sense if it is normally non-zero.  Returning 0 here
+				// left every release a single segment followed by a permanent hold.
 				u8 log_level = 0;
 				if (level)
 					log_level = (u8)std::clamp(
 							(int)lround(16.0 * log2(double(level) / ENV_FULL) + 255.0), 1, 255);
-				value = u16(log_level) << 8;
+				value = (u16(log_level) << 8) | (m_chns[m_status_voice].volume & 0x00FF);
 			}
 			break;
 		}
