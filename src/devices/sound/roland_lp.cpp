@@ -61,6 +61,17 @@ void mb87419_mb87420_device::device_start()
 
 	m_stream = stream_alloc(0, m_out_count, m_rate);
 
+	m_env_timer = timer_alloc(FUNC(mb87419_mb87420_device::env_tick), this);
+	if (m_env_engine)
+	{
+		// Free-running from reset.  The handler cannot run before the firmware unmasks
+		// EXTINT at 0x4530 anyway, and by then it has cleared the per-voice state at
+		// 0x445D -- so an offer made earlier simply waits as a pending interrupt.
+		attotime const period = attotime::from_hz(2 * m_env_scan_hz);
+		m_env_timer->adjust(period, 0, period);
+		logerror("Envelope interrupts: arrival driven, at most %u/s\n", m_env_scan_hz);
+	}
+
 	logerror("Roland PCM: Clock %u, Rate %u\n", m_clock, m_rate);
 }
 
@@ -70,6 +81,13 @@ void mb87419_mb87420_device::device_start()
 
 void mb87419_mb87420_device::device_reset()
 {
+	m_env_int = false;
+	m_env_service = 0;
+	m_env_pending = 0;
+	m_status_voice = 0;
+	m_status_field = 0;
+	for (auto &chn : m_chns)
+		chn.env_level = chn.env_target = chn.env_rate = 0.0;
 	m_int_callback(CLEAR_LINE);
 }
 
@@ -87,6 +105,49 @@ void mb87419_mb87420_device::rom_bank_pre_change()
 
 u8 mb87419_mb87420_device::read(offs_t offset)
 {
+	if (m_env_engine && offset <= 0x03)
+	{
+		// 00 - which voice is asking for its next envelope segment.  Reading it is the
+		// acknowledge: the line drops, and rises again if another voice is still waiting.
+		if (offset == 0x00)
+		{
+			// Reading it is the acknowledge for that voice.
+			m_env_pending &= ~(1u << m_env_service);
+			return m_env_service;
+		}
+		// 02/03 - the selected voice's current level, in whichever field the last select
+		// asked for.  The firmware glues the low 16 and high 10 together and normalises.
+		m_stream->update();
+		u32 const level = (u32)std::clamp(m_chns[m_status_voice].env_level, 0.0, ENV_FULL - 1.0);
+		u16 value;
+		switch (m_status_field)
+		{
+		case 0:  value = level & 0xFFFF; break;                 // select 0x10
+		case 1:  value = (level >> 16) & 0x03FF; break;         // select 0x12
+		// Select 0x1A is NOT a level at all: it reads the voice's current PLAY ADDRESS.
+		// 0x71AA selects a voice here, reads 0x1404, and compares it with 3720[voice] --
+		// and 3720[voice] is written at 0x66BA from the very word the firmware just sent to
+		// register 0x0E, the sample LOOP address.  So the question being asked is "has this
+		// voice reached its loop point yet", which is what gates several envelope phases.
+		// Same units as reg 0x0E: the address is 18.14 fixed point and the loop offset is
+		// in 4-byte units, so the high word of the accumulator is exactly it.
+		case 3:  value = (m_chns[m_status_voice].addr >> 16) & 0xFFFF; break;
+		default:                                                // select 0x16
+			{
+				// The log level, the same scale as register 07 -- what the firmware's own
+				// normalise-and-take-the-exponent at 0x7683 produces.  It lands in the HIGH
+				// byte, which is where the envelope handler reads it (0x42D0, 0x432C).
+				u8 log_level = 0;
+				if (level)
+					log_level = (u8)std::clamp(
+							(int)lround(16.0 * log2(double(level) / ENV_FULL) + 255.0), 1, 255);
+				value = u16(log_level) << 8;
+			}
+			break;
+		}
+		return (offset == 0x02) ? (value & 0xFF) : (value >> 8);
+	}
+
 	// Note: only offset 0x01 is verified, the rest is probably all wrong
 	if (offset != 0x01)
 		logerror("Reading Reg %02X\n", offset);
@@ -183,11 +244,19 @@ void mb87419_mb87420_device::write(offs_t offset, u8 data)
 		case 0x05:  // sample step LSB
 			chn.step = (chn.step & 0x00FF) | (data << 8);
 			break;
-		case 0x06:  // volume LSB
+		case 0x06:  // envelope rate (signed) -- see roland_lp.h
+			if (m_env_engine)
+				m_stream->update();     // gated: an extra update changes the engine-off output
 			chn.volume = (chn.volume & 0xFF00) | (data << 0);
+			if (m_env_engine)
+				env_segment(chn);
 			break;
-		case 0x07:  // volume MSB
+		case 0x07:  // envelope target level (log, 16 units per octave)
+			if (m_env_engine)
+				m_stream->update();
 			chn.volume = (chn.volume & 0x00FF) | (data << 8);
+			if (m_env_engine)
+				env_segment(chn);
 			break;
 		case 0x08:  // current address, fraction LSB
 			chn.start = (chn.start & 0xFFFFFF00) | (data <<  0);
@@ -242,6 +311,15 @@ void mb87419_mb87420_device::write(offs_t offset, u8 data)
 					{
 						chn.env = 1.0;
 						chn.releasing = false;
+						if (m_env_engine)
+						{
+							// A new note starts from silence and the attack walks up; the
+							// volume word the firmware wrote just before is the first
+							// segment.
+							m_env_pending &= ~(1u << (basechn + ch_id));
+							chn.env_level = 0.0;
+							env_segment(chn);
+						}
 						chn.acc = chn.acc_prev = 0.0;
 						chn.pp_sign = 1;
 						chn.pp_off = 0.0;
@@ -271,6 +349,23 @@ void mb87419_mb87420_device::write(offs_t offset, u8 data)
 				}
 			}
 			break;
+		// The three status selects.  Each names a voice AND picks which field of its level
+		// register 02/03 will hand back; the firmware reads all three in turn at 0x7655.
+		case 0x10:
+		case 0x12:
+		case 0x16:
+		case 0x1A:
+			if (m_env_engine)
+			{
+				m_status_voice = data & 0x1F;
+				m_status_field = (offset == 0x10) ? 0 : (offset == 0x12) ? 1
+							   : (offset == 0x16) ? 2 : 3;
+			}
+			else
+			{
+				logerror("Writing unknown reg %02X = %02X\n", offset, data);
+			}
+			break;
 		case 0x1F:
 			m_sel_chn = data & 0x1F;
 			break;
@@ -279,6 +374,93 @@ void mb87419_mb87420_device::write(offs_t offset, u8 data)
 			break;
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------------
+// The envelope ramp generator.  See roland_lp.h for what was measured and where.
+// ---------------------------------------------------------------------------------
+
+// Register 07 -> the chip's linear level.  The firmware's own readback normalises the
+// 26-bit level into exponent*16 + mantissa, so this is that map run backwards.  Level 0 is
+// a special case and has to be exactly zero: the power-up loop at 0xCC1F spins until the
+// level reads 0 or 1, and an asymptote at 2^10 would hang it forever.
+double mb87419_mb87420_device::env_level_for(uint8_t log_level) const
+{
+	if (! log_level)
+		return 0.0;
+	return ENV_FULL * exp2((double(log_level) - 255.0) / 16.0);
+}
+
+// One write of the volume word is one envelope segment: where to go, and how fast.
+void mb87419_mb87420_device::env_segment(pcm_channel &chn)
+{
+	chn.env_target = env_level_for(chn.volume >> 8);
+
+	int const rate = (int8_t)(chn.volume & 0xFF);    // SIGNED: + rises, - falls
+	if (! rate)
+	{
+		chn.env_rate = 0.0;
+		return;
+	}
+	// 8.01 counts per doubling, measured; the sign says which way, the magnitude how fast.
+	double const speed = exp2(double(abs(rate)) / 8.0) * ENV_RATE_SCALE;
+	chn.env_rate = (rate > 0) ? speed : -speed;
+
+	// A segment that already points the wrong way has nothing to do.  This happens
+	// naturally: the firmware writes a falling rate for a voice that is already below its
+	// new target, and the chip should just sit there rather than run away.
+	if ((chn.env_rate > 0.0 && chn.env_level >= chn.env_target)
+			|| (chn.env_rate < 0.0 && chn.env_level <= chn.env_target))
+	{
+		chn.env_level = chn.env_target;
+		chn.env_rate = 0.0;
+	}
+}
+
+TIMER_CALLBACK_MEMBER(mb87419_mb87420_device::env_tick)
+{
+	env_scan();
+}
+
+// Offer the next slot to the CPU.  Free-running and round-robin: the handler at 0x41C4
+// reads register 00 to learn which slot it has been given, and decides for itself whether
+// that slot needs anything.  EXTINT is edge triggered on the 8x9x, so the line goes up
+// here and comes down when register 00 is read.  If the CPU has not answered the previous
+// offer yet, this one is simply lost -- which is what the hardware would do too.
+void mb87419_mb87420_device::env_scan()
+{
+	// Nothing has arrived: hold the line low and leave the CPU alone.
+	if (! m_env_pending)
+	{
+		if (m_env_int)
+		{
+			m_env_int = false;
+			m_int_callback(CLEAR_LINE);
+		}
+		return;
+	}
+	// The 8x9x latches EXTINT on a RISING edge (i8x9x.cpp, execute_set_input), so INT is
+	// PULSED: this timer runs at twice the ceiling rate and toggles, giving one clean
+	// low-high transition per offer.  Holding the line high and waiting for the handler to
+	// acknowledge does not work -- the first edge is made before the firmware unmasks the
+	// interrupt, it is lost, and with the line already high no further edge is ever
+	// produced -- and dropping and raising it in the same instant does not reliably reach
+	// the CPU as a single edge either.
+	m_env_int = ! m_env_int;
+	if (m_env_int)
+		for (unsigned i = 0; i < NUM_CHANNELS; i ++)
+			if (BIT(m_env_pending, i))
+			{
+				m_env_service = i;
+				break;
+			}
+	m_int_callback(m_env_int ? ASSERT_LINE : CLEAR_LINE);
+}
+
+// A voice's ramp reached its target: it needs its next envelope segment.
+void mb87419_mb87420_device::env_arrived(unsigned voice)
+{
+	m_env_pending |= 1u << voice;
 }
 
 // The voice volume pair is NOT a linear 16-bit magnitude, and it is not two levels: it is
@@ -322,7 +504,12 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 {
 	for (auto& chn : m_chns)
 	{
-		if ((! chn.enable && ! chn.releasing) || chn.play_dir == 0)
+		// With the ramp generator the fade after note-off is the envelope's, driven by the
+		// firmware, so the voice lives exactly as long as its enable bit says.  Without it,
+		// `releasing` keeps the voice alive for the device's own stand-in fade.
+		if (m_env_engine ? ! chn.enable : (! chn.enable && ! chn.releasing))
+			continue;
+		if (chn.play_dir == 0)
 			continue;
 
 		for (int smpl = 0; smpl < stream.samples(); smpl ++)
@@ -335,14 +522,46 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 			// Note the casts: volume_gain() returns uint32_t, and s32 * uint32_t is
 			// evaluated UNSIGNED, so a negative sample would wrap to a huge positive
 			// value before the envelope multiply ever saw it.
-			smp_data = (s32)((double)smp_data * (double)volume_gain(chn.volume) * chn.env);
-			chn.env *= chn.releasing ? m_env_release_step : m_env_decay_step;
-			if (chn.releasing && chn.env < 6.0e-5)   // -84 dB: below the DAC's own floor
+			if (m_env_engine)
 			{
-				chn.releasing = false;
-				chn.play_dir = 0;
-				chn.env = 0.0;
-				break;
+				// The ramp generator IS the volume: the level is where the envelope has
+				// got to, on the same 0..2^26 scale full output sits at.  volume_gain()'s
+				// 16-bit result is what the mixer's 32768 << 14 divisor expects, so scale
+				// to that.
+				smp_data = (s32)((double)smp_data * chn.env_level * (65536.0 / ENV_FULL));
+
+				if (chn.env_rate > 0.0)
+				{
+					chn.env_level += chn.env_rate;
+					if (chn.env_level >= chn.env_target)
+					{
+						chn.env_level = chn.env_target;
+						chn.env_rate = 0.0;
+						env_arrived(&chn - &m_chns[0]);
+					}
+				}
+				else if (chn.env_rate < 0.0)
+				{
+					chn.env_level += chn.env_rate;
+					if (chn.env_level <= chn.env_target)
+					{
+						chn.env_level = chn.env_target;
+						chn.env_rate = 0.0;
+						env_arrived(&chn - &m_chns[0]);
+					}
+				}
+			}
+			else
+			{
+				smp_data = (s32)((double)smp_data * (double)volume_gain(chn.volume) * chn.env);
+				chn.env *= chn.releasing ? m_env_release_step : m_env_decay_step;
+				if (chn.releasing && chn.env < 6.0e-5)   // -84 dB: below the DAC's own floor
+				{
+					chn.releasing = false;
+					chn.play_dir = 0;
+					chn.env = 0.0;
+					break;
+				}
 			}
 			if (m_out_count <= 2)
 			{

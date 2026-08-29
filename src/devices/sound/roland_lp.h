@@ -35,13 +35,60 @@ public:
 	void set_output_count(int count) { m_out_count = count; }
 	void set_voice_mask(u8 voice, u8 mask) { if (voice < NUM_CHANNELS) m_voice_mask[voice] = mask; }
 
-	// Amplitude envelope.  The chip generates one; the CPU writes a voice's volume once
-	// at note-on and never touches it again, yet hardware keeps fading -- measured in
-	// listen/2/ENVELOPE.md.  Rates are dB/s, both exponential (a straight line in dB fits
-	// the measured release at R2 0.92-1.00, better than a straight line in amplitude).
-	// The U-110's sysex exposes exactly two envelope parameters per part, ENV ATTACK RATE
-	// and ENV RELEASE RATE, each -7..+7 around a default -- so attack and release are the
-	// only rates the instrument itself lets you set.
+	// The envelope ramp generator, and the interrupt that drives it.  OFF by default, so
+	// the CM-32P / D-70 / R-8 / U-20 drivers keep the behaviour they were tuned against.
+	//
+	// Registers 06/07 are one envelope SEGMENT, not a volume: 07 is the TARGET level (log,
+	// 16 units per octave) and 06 is a SIGNED ramp RATE.  The chip walks a linear level
+	// toward the target and raises INT when it arrives; the CPU's handler then writes the
+	// next segment.  Measured on hardware (listen/env/ANALYSIS.md, listen/env2):
+	//
+	//   * going UP the ramp is linear in AMPLITUDE -- 0.14 dB rms over 29 dB, against
+	//     2.36 dB rms for a straight line in dB;
+	//   * the rate byte is a pure exponential, 8.01 counts per doubling (2.4% residual
+	//     over 41 trials at rate bytes 2..40).  A 3-bit-mantissa float gives 15.4% and is
+	//     ruled out;
+	//   * one increment of 2^(rate/8) * 64 per output sample on a 26-bit level reproduces
+	//     the measured attack times at rate bytes 8, 24 and 40 (2.456 / 0.616 / 0.153 s at
+	//     target 211) to better than 1%.
+	//
+	// Falling ramps measure EXPONENTIAL, which is not what a linear ramp generator does --
+	// but it does not have to be the chip: the firmware's handler at 0x42B3 adds
+	// (3986[voice] * reg07) >> 9 to the rate with reg07 refreshed from this level readback,
+	// i.e. a rate proportional to the current level.  That IS an exponential, assembled one
+	// interrupt at a time.  If this model is right, the decay falls out on its own.
+	void set_env_engine(bool on) { m_env_engine = on; }
+
+	// The interrupt is a free-running ROUND-ROBIN scanner, not a signal that a ramp
+	// finished: the handler reads register 00 to learn WHICH slot it is being offered,
+	// checks that slot's own state and usually does nothing.  Reading it as "interrupt on
+	// arrival" instead produces an interrupt storm -- the CPU answers each one with a fresh
+	// segment, that segment arrives at once, and it interrupts again.
+	//
+	// The chip raises INT when a voice's ramp ARRIVES at its target, naming that voice in
+	// register 00; the handler's phase machine then advances one step and programs the next
+	// segment.  The advance at 0xBAD4 is an unconditional `incb`, so one interrupt IS one
+	// envelope step -- which is why a free-running round-robin over all 34 slots cannot be
+	// right: to give a piano its attack it would have to run at ~11000 a second, and the
+	// handler costs far too much for that.  Arrival-driven, a note needs about four.
+	//
+	// This is paced rather than instantaneous: the line is offered on a timer, so several
+	// voices arriving together queue instead of racing, and the rate below is a CEILING on
+	// how often the CPU can be interrupted, not a fixed cadence.  Idle voices cost nothing.
+	//
+	// Registers 0x19 / 0x1B / 0x1D are NOT scanner configuration, though the 0x00/0x21/0x64
+	// the firmware writes to them at 0x43DA looks like it: the same trio is rewritten at
+	// 0xB4C6 from the patch's CHORUS/TREMOLO byte (0x280E) through a table at 0xA726, and
+	// the code beside it writes 0x378C / 0x378E -- exactly the RAM the handler's 0x20 / 0x21
+	// branches read.  That trio is the chorus/tremolo subsystem and those two slots are its
+	// LFOs.  Driving the scanner from 0x1D switched the envelope off whenever the firmware
+	// retuned the chorus.
+	void set_env_max_int_hz(u32 hz) { m_env_scan_hz = hz ? hz : 1; }
+
+
+	// The older stand-in for all of the above: a fixed exponential fade the device applies
+	// itself, with no interrupt and no level readback.  Superseded by set_env_engine(true)
+	// and left for the drivers that have not been measured.
 	void set_env_release_db_per_s(double db) { m_env_release = db; }
 	void set_env_decay_db_per_s(double db) { m_env_decay = db; }
 
@@ -65,6 +112,8 @@ protected:
 
 	static int16_t decode_sample(int8_t data);
 	static int16_t sample_interpolate(int16_t smp1, int16_t smp2, uint16_t frac);
+
+	TIMER_CALLBACK_MEMBER(env_tick);
 
 private:
 	static constexpr unsigned NUM_CHANNELS = 32;
@@ -100,7 +149,29 @@ private:
 		// envelope
 		double  env = 1.0;      // linear gain applied on top of the volume registers
 		bool    releasing = false;
+
+		// envelope ramp generator (m_env_engine).  env_level is the chip's own 26-bit
+		// LINEAR level -- the quantity the firmware reads back and normalises.
+		double  env_level = 0.0;
+		double  env_target = 0.0;
+		double  env_rate = 0.0;     // signed, per output sample; 0 = arrived, holding
 	};
+
+	// The level is 26 bits.  The firmware reads it as two fields (low 16 through select
+	// 0x10, high 10 through 0x12), glues them into one 32-bit word, shifts left by 6 and
+	// normalises -- so the top of the 26-bit range lands at the top of the 32-bit word,
+	// and the log value it derives is exactly register 07's scale.  See the readback at
+	// 0x7655 in analysis/ROM-ANALYSIS.md.
+	static constexpr double ENV_FULL = 67108864.0;      // 2^26, level at reg 07 = 0xFF
+	// The rate byte's increment carries six fractional bits: 2^(rate/8) counts the level's
+	// 64ths.  This is the constant the hardware attack times pin down.
+	static constexpr double ENV_RATE_SCALE = 64.0;
+
+
+	double env_level_for(uint8_t log_level) const;
+	void env_segment(pcm_channel &chn);
+	void env_scan();
+	void env_arrived(unsigned voice);
 
 	devcb_write_line m_int_callback;
 
@@ -119,6 +190,19 @@ private:
 	double m_env_decay = 0.0;           // dB/s while the key is held
 	double m_env_release_step = 1.0;    // per-sample multipliers, derived from the above
 	double m_env_decay_step = 1.0;
+
+	// envelope ramp generator
+	bool m_env_engine = false;
+	u32 m_env_scan_hz = 8000;           // ceiling on interrupts/s
+	u32 m_env_pending = 0;              // one bit per voice whose ramp has arrived
+	u32 m_env_slots = 0x22;             // 32 voices plus the two chorus/tremolo slots
+	emu_timer *m_env_timer = nullptr;   // ...which is its own timer, not the sound stream:
+	                                    // pulsing once per stream block would collapse a
+	                                    // whole block's worth of offers into one edge
+	uint8_t m_env_service = 0;          // the slot register 0x00 is currently reporting
+	bool m_env_int = false;             // state of the INT line
+	uint8_t m_status_voice = 0;         // voice selected for the 0x02/0x03 readback
+	uint8_t m_status_field = 0;         // 0 = low 16 bits, 1 = high 10 bits, 2 = log level
 };
 
 DECLARE_DEVICE_TYPE(MB87419_MB87420, mb87419_mb87420_device)

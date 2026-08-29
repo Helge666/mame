@@ -213,10 +213,15 @@ private:
 	u16 battery_r();
 
 	// sound chip window
+	// `[I]` The tone generator's envelope ramp generator and its interrupt.  See the
+	// machine config for why this is false; flipping it switches snd_r between the device's
+	// real level readback and the stand-in below, so the two stay consistent.
+	static constexpr bool ENV_ENGINE = false;
+
+	u16 voice_status() const;
 	u16 snd_r(offs_t offset, u16 mem_mask);
 	void snd_w(offs_t offset, u16 data, u16 mem_mask);
 	u8 pcm_data_r();
-	u16 voice_status() const;
 
 	// output routing (BU3905)
 	void out_ctrl_w(offs_t offset, u16 data, u16 mem_mask);
@@ -252,6 +257,8 @@ private:
 	u8 m_rx_data = 0;
 
 	u8  m_snd_regs[0x20]{};     // shadow of what the CPU wrote, for the read port and tracing
+	u8  m_stat_idx = 0;     // voice index written to sound-chip register 0x10 / 0x12
+	attotime m_voice_quiet[32];
 	u8  m_card_present = 0x0f;  // bit per slot, 1 = empty (PORT1 is active low)
 	u8  m_port2 = 0;
 	u16 m_leds = 0;
@@ -259,8 +266,6 @@ private:
 	bool m_trace_midi_rx = true;
 	u32 m_scan = 0;                        // firmware panel scans since power-on (100 Hz)
 	bool m_mode_announced = false;
-	u8  m_stat_idx = 0;     // voice index written to sound-chip register 0x10 / 0x12
-	attotime m_voice_quiet[32];
 };
 
 
@@ -488,22 +493,18 @@ u16 roland_u110_state::battery_r()
 **************************************************************************************/
 
 // Reading 0x1404 (device registers 02/03) does NOT return the ROM bank that was written
-// there: it is a per-voice LEVEL, indexed by whatever was last written to register 0x10 or
-// 0x12.  MAME's device notes only "02/03 - ?? (read after writing to 10/12)".  Two places
-// use it, and both matter:
+// there: it is the selected voice's current envelope LEVEL, and which field of it comes
+// back depends on whether 0x10, 0x12 or 0x16 named the voice.  Three places depend on it:
 //
-//   0x641A  note-on: read both statuses for a voice; if both are zero the voice is FREE
-//   0xCC0F  release: set a voice's volume low, then spin until its level reaches zero
+//   0x641A  note-on: read a voice's level; zero means the voice is FREE
+//   0x7655  the envelope handler: all three fields, normalised to a log level
+//   0xCC0F  power-up: set a voice's volume low, then spin until its level reaches zero
 //
-// This is the voice-allocation and voice-release handshake -- what roland_lp.cpp's TODO
-// calls "how freeing a voice works".  Returning a constant zero says "every voice is idle",
-// which lets the firmware run but makes it allocate voices that are still sounding.
-// Returning a constant non-zero hangs it in the release spin.
-//
-// Modelled here as: a voice reads busy while it is enabled, and goes quiet a short time
-// after its volume is set low (which is exactly what the release routine does before it
-// starts waiting).  `[I]` The decay time is a guess -- the real chip presumably reports an
-// envelope ramping down -- but the shape of the handshake is what the firmware depends on.
+// The device answers all three when its envelope ramp generator is on, and snd_r forwards
+// to it. With it off there is no level to report, so this stands in: a voice reads busy
+// while it is enabled and goes idle a fixed 8 ms after a low volume is written, which is
+// exactly what the release routine does before it starts waiting. It is enough to keep the
+// firmware allocating and freeing voices, and no use at all for driving an envelope.
 static constexpr attoseconds_t VOICE_FADE = ATTOSECONDS_PER_MILLISECOND * 8;
 
 u16 roland_u110_state::voice_status() const
@@ -521,12 +522,19 @@ u16 roland_u110_state::snd_r(offs_t offset, u16 mem_mask)
 {
 	u16 result = 0;
 
+	// Registers 00 and 02/03 come from the tone generator itself once the envelope ramp
+	// generator is running: 00 names the voice asking for its next envelope segment, and
+	// 02/03 hand back that voice's current level.  Both are what the firmware's EXTINT
+	// handler at 0x41C4 runs on -- see the note above snd_r.
 	if (ACCESSING_BITS_0_7)
 	{
 		if (offset == 0x01)
 			result |= pcm_data_r();
+		else if (offset == 0x00 && ENV_ENGINE)
+			return m_pcm->read(0x00);   // NOT offset+1: register 01 is the ROM read port
 		else if (offset == 0x02)
-			return voice_status();
+			return ENV_ENGINE ? (u16(m_pcm->read(0x02)) | (u16(m_pcm->read(0x03)) << 8))
+							  : voice_status();
 		else
 			result |= m_snd_regs[offset];
 	}
@@ -542,14 +550,14 @@ void roland_u110_state::snd_w(offs_t offset, u16 data, u16 mem_mask)
 	{
 		m_snd_regs[offset] = data & 0xff;
 		if (offset == 0x10 || offset == 0x12)
-			m_stat_idx = data & 0x1f;           // selects the voice the status refers to
+			m_stat_idx = data & 0x1f;           // which voice voice_status() refers to
 		m_pcm->write(offset, data & 0xff);
 		if (m_trace_tg)
 			logerror("TG %f v%02X reg %02X = %02X  @%s\n",
 					machine().time().as_double(), m_snd_regs[0x1f] & 0x1f, offset, data & 0xff,
 					machine().describe_context());
 	}
-	// a low volume written to the selected voice starts its release
+	// a low volume written to the selected voice starts its release (voice_status() only)
 	if (offset == 0x06 && ACCESSING_BITS_8_15 && (data & 0xff00) == 0 && (data & 0xff) < 0x40)
 		m_voice_quiet[m_snd_regs[0x1f] & 0x1f] = machine().time() + attotime(0, VOICE_FADE);
 
@@ -975,18 +983,31 @@ void roland_u110_state::u110(machine_config &config)
 	m_pcm->set_delta_dc_hz(0.0);            // a true integrator; the loops are DC balanced
 	m_pcm->set_rate_divider(1088);
 	m_pcm->set_output_count(6);
-	// Note-off release.  The CPU writes a voice's volume once at note-on and never again,
-	// so the fade after note-off is the chip's.  Measured from listen/2 against a dry
-	// render of the same wave-ROM data (see listen/2/ENVELOPE.md): seven notes across four
-	// octaves and three velocities fall 14-30 dB in 124-252 ms, and a straight line in dB
-	// fits at R2 0.92-1.00 -- exponential, averaging 127 dB/s.
+	// The envelope is the firmware's, not ours: the chip ramps a level and interrupts when
+	// it arrives, and the handler at 0x41C4 writes the next segment.  Everything the
+	// U-110's own parameters reach -- ENV ATTACK RATE, ENV RELEASE RATE, key scaling, the
+	// per-tone decay shapes -- comes along with it, because it is the real code running.
+	// Calibrated against listen/env and listen/env2; see listen/env/ANALYSIS.md.
+	// `[I]` OFF, deliberately, and one line from being on.  Everything the real mechanism
+	// needs is implemented and verified: the ramp generator is calibrated against hardware
+	// and gets the attack right, the level readback answers the firmware's voice
+	// allocation and its power-up spin, the scanner is configured by the firmware's own
+	// registers, and the handler at 0x41C4 runs and writes real segments -- a note-off
+	// produces a negative rate byte from 0x6524, which is the release path.
+	//
+	// What is not right yet is the SHAPE.  The per-voice phase machine does not advance, so
+	// held notes do not decay and the release comes out at the minimum rate (-2), which is
+	// slow enough that the firmware never sees a voice go quiet and never frees it: a
+	// fourteen-note sequence sounds eight.  Turning this on today trades a correct attack
+	// for a lost release and leaked voices, which is a bad trade.  See listen/env/ANALYSIS.md
+	// and WORKING-STATE.md for what is left.
+	m_pcm->set_env_engine(ENV_ENGINE);
+	m_pcm->set_env_max_int_hz(8000);
+	// The stand-in, used while the above is off: a fixed exponential fade with no interrupt
+	// and no level readback.  Measured from listen/2 against a dry render of the same wave
+	// ROM data (listen/2/ENVELOPE.md): seven notes across four octaves and three velocities
+	// fall 14-30 dB in 124-252 ms, a straight line in dB at R2 0.92-1.00, averaging 127 dB/s.
 	m_pcm->set_env_release_db_per_s(127.0);
-	// Held-note decay is left at zero deliberately.  Hardware clearly has one -- the same
-	// measurement shows 3.7-7.8 dB/s of fade that the sample data does not account for --
-	// but no register the CPU writes changes between notes that decay at different rates,
-	// and the U-110's own sysex exposes only ENV ATTACK RATE and ENV RELEASE RATE per part
-	// (0x001n0A / 0x001n0B, -7..+7), with no decay parameter at all.  Until we can source
-	// it, a fixed rate here would be a fudge that hides the error rather than fixing it.
 	m_pcm->set_env_decay_db_per_s(0.0);
 	// Six Multi Outputs, summed to the MIX pair.
 	//

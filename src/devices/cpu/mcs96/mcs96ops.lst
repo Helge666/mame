@@ -4,8 +4,13 @@ fetch
 	if(irq_requested) {
 		int level;
 		for(level = 7; level >= 0 && !(PSW & pending_irq & (1<<level)); level--);
-		if(level != 7)
-			pending_irq &= ~(1<<level);
+		// Clearing the pending bit is part of taking the vector, level 7 included.  Level 7
+		// is EXTINT, and leaving it set made EXTINT unusable: the handler runs, re-enables
+		// interrupts, and is immediately re-entered by the same still-pending request, for
+		// ever.  The Roland U-110 is the case in point -- its MB87419 drives EXTINT to hand
+		// the CPU one envelope slot at a time, and a single edge turned into roughly nine
+		// hundred entries to the handler, so the machine never finished booting.
+		pending_irq &= ~(1<<level);
 		OP1 = level;
 		standard_irq_callback(OP1, PC);
 		TMP = reg_r16(0x18);
