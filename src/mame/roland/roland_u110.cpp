@@ -216,7 +216,7 @@ private:
 	// `[I]` The tone generator's envelope ramp generator and its interrupt.  See the
 	// machine config for why this is false; flipping it switches snd_r between the device's
 	// real level readback and the stand-in below, so the two stay consistent.
-	static constexpr bool ENV_ENGINE = false;
+	static constexpr bool ENV_ENGINE = true;
 
 	u16 voice_status() const;
 	u16 snd_r(offs_t offset, u16 mem_mask);
@@ -560,6 +560,15 @@ void roland_u110_state::snd_w(offs_t offset, u16 data, u16 mem_mask)
 	// a low volume written to the selected voice starts its release (voice_status() only)
 	if (offset == 0x06 && ACCESSING_BITS_8_15 && (data & 0xff00) == 0 && (data & 0xff) < 0x40)
 		m_voice_quiet[m_snd_regs[0x1f] & 0x1f] = machine().time() + attotime(0, VOICE_FADE);
+
+	// The status selects are byte registers that happen to be written with a 16-bit store.
+	// 0x142C in particular is `st 54, 142c` in the envelope handler, and forwarding its
+	// high half by the rule below would put it in register 0x17 -- the voice-enable group
+	// for voices 24-31 -- silently switching eight voices off on every status select.  That
+	// is what made choir3_pingpong, shakuhachi, drums and the Wide Piano segments retrigger
+	// their notes: only the segments whose voices landed in 24-31 were affected.
+	if (offset == 0x10 || offset == 0x12 || offset == 0x16 || offset == 0x1a)
+		return;
 
 	if (ACCESSING_BITS_8_15 && offset < 0x1f)
 	{
@@ -988,25 +997,29 @@ void roland_u110_state::u110(machine_config &config)
 	// U-110's own parameters reach -- ENV ATTACK RATE, ENV RELEASE RATE, key scaling, the
 	// per-tone decay shapes -- comes along with it, because it is the real code running.
 	// Calibrated against listen/env and listen/env2; see listen/env/ANALYSIS.md.
-	// `[I]` OFF, deliberately, and one line from being on.  Everything the real mechanism
-	// needs is implemented and verified: the ramp generator is calibrated against hardware
-	// and gets the attack right, the level readback answers the firmware's voice
-	// allocation and its power-up spin, the scanner is configured by the firmware's own
-	// registers, and the handler at 0x41C4 runs and writes real segments -- a note-off
-	// produces a negative rate byte from 0x6524, which is the release path.
+	// ON.  The chip ramps a level and interrupts when it arrives; the firmware's handler at
+	// 0x41C4 writes the next segment.  Everything the instrument's own parameters reach --
+	// ENV ATTACK RATE, ENV RELEASE RATE, key scaling, the per-tone decay shapes -- comes
+	// along with it, because it is the real code running.
 	//
-	// What is not right yet is the SHAPE.  The per-voice phase machine does not advance, so
-	// held notes do not decay and the release comes out at the minimum rate (-2), which is
-	// slow enough that the firmware never sees a voice go quiet and never frees it: a
-	// fourteen-note sequence sounds eight.  Turning this on today trades a correct attack
-	// for a lost release and leaked voices, which is a bad trade.  See listen/env/ANALYSIS.md
-	// and WORKING-STATE.md for what is left.
+	// Measured against listen/env and listen/env2 (tools/capture_env.py):
+	//   * attack, Vib 1: 2.162 / 0.516 / 0.122 / 0.018 s against 2.164 / 0.540 / 0.122 /
+	//     0.018 on hardware;
+	//   * release, E. Organ 1 and Choir 3: a constant 0.92-0.94x across 125x of rate, both
+	//     doubling step for step with ENV RELEASE;
+	//   * decay, all twelve tones of decay_hold, timed above the recording's noise floor --
+	//     marimba 0.23/0.48/1.01 s to fall 10/20/40 dB against 0.24/0.48/0.96 measured,
+	//     piano 0.63/1.17/5.71 against 0.64/1.14/5.07, fbass 1.07/2.16/4.36 against
+	//     1.05/2.10/4.18.
+	//
+	// And across the whole listen/3 reference session: sixteen of seventeen segments
+	// allocate voices identically to the old stand-in, and the dB envelope correlates
+	// 0.79-0.95 with the hardware recording segment for segment.
 	m_pcm->set_env_engine(ENV_ENGINE);
-	m_pcm->set_env_max_int_hz(8000);
-	// The stand-in, used while the above is off: a fixed exponential fade with no interrupt
-	// and no level readback.  Measured from listen/2 against a dry render of the same wave
-	// ROM data (listen/2/ENVELOPE.md): seven notes across four octaves and three velocities
-	// fall 14-30 dB in 124-252 ms, a straight line in dB at R2 0.92-1.00, averaging 127 dB/s.
+	m_pcm->set_env_max_int_hz(32000);
+	// The old stand-in, reachable only by setting ENV_ENGINE false: a fixed exponential fade
+	// with no interrupt and no level readback.  Kept one flag away for now; it and
+	// voice_status() should go once this has had some mileage.
 	m_pcm->set_env_release_db_per_s(127.0);
 	m_pcm->set_env_decay_db_per_s(0.0);
 	// Six Multi Outputs, summed to the MIX pair.
