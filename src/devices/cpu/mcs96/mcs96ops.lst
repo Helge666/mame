@@ -761,7 +761,12 @@ fe4f  mul   indexed_3w
 
 5f    mulub indexed_3e
 	TMP = any_r8(OP1);
-	TMP = reg_r8(OP2);
+	// Was `TMP = reg_r8(OP2);` -- the multiply was dropped, so this returned the register
+	// unchanged and discarded the indexed operand.  Every sibling (5c/5d/5e, 7c-7f, and the
+	// signed fe5f) multiplies.  The Roland U-110 computes its note-off release rate with
+	// exactly this instruction, `mulub 4a, 44, afc6[48]` at 0x64A0: 96 * 66 came back as 96,
+	// the rate clamped to its minimum, and every release stalled.
+	TMP *= reg_r8(OP2);
 	reg_w16(OP3, TMP);
 	post_indexed 20 21 // +5 when external
 
