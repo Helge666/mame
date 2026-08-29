@@ -256,8 +256,10 @@ void mb87419_mb87420_device::write(offs_t offset, u8 data)
 			if (m_env_engine)
 				m_stream->update();     // gated: an extra update changes the engine-off output
 			chn.volume = (chn.volume & 0xFF00) | (data << 0);
-			if (m_env_engine)
-				env_segment(chn);
+			// Deliberately NOT env_segment() here.  The firmware always writes the pair as
+			// one 16-bit store and the bus splits it into 06 then 07, so acting on the low
+			// byte alone evaluates the new rate against the OLD target -- which trivially
+			// looks like an arrival and advances the phase machine a step early.
 			break;
 		case 0x07:  // envelope target level (log, 16 units per octave)
 			if (m_env_engine)
@@ -425,14 +427,20 @@ void mb87419_mb87420_device::env_segment(pcm_channel &chn)
 	double const speed = exp2(double(abs(rate)) / 8.0) * scale;
 	chn.env_rate = (rate > 0) ? speed : -speed;
 
-	// A segment that already points the wrong way has nothing to do.  This happens
-	// naturally: the firmware writes a falling rate for a voice that is already below its
-	// new target, and the chip should just sit there rather than run away.
+	// A segment can be written that is already at, or past, its target.  It is not a no-op:
+	// it finishes IMMEDIATELY, and the handler has to be told so, because that interrupt is
+	// what advances the envelope to its next phase.
+	//
+	// Tone data does this on purpose.  Marimba's phase 1 asks for a decay to exactly the
+	// level the attack just reached -- a zero-length segment whose only job is to move the
+	// phase on, with the real decay in a later phase.  Swallowing it silently left marimba
+	// and Fretless Bass stuck in phase 1, holding flat for the whole note.
 	if ((chn.env_rate > 0.0 && chn.env_level >= chn.env_target)
 			|| (chn.env_rate < 0.0 && chn.env_level <= chn.env_target))
 	{
 		chn.env_level = chn.env_target;
 		chn.env_rate = 0.0;
+		env_arrived(&chn - &m_chns[0]);
 	}
 }
 
