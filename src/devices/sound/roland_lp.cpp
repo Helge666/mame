@@ -438,6 +438,13 @@ void mb87419_mb87420_device::env_segment(pcm_channel &chn)
 
 TIMER_CALLBACK_MEMBER(mb87419_mb87420_device::env_tick)
 {
+	// Advance the audio -- and with it the envelope ramps -- before deciding what to offer
+	// the CPU.  Without this the level only moves when MAME next updates the sound stream,
+	// which is every 20 ms, so a voice could arrive at its target and be told about it at
+	// most fifty times a second.  An envelope segment is often much shorter than that: the
+	// release chain quantised to a flat 20 ms per segment and saturated around 316 dB/s
+	// however large a rate the firmware asked for, against 5 to 1200 dB/s on hardware.
+	m_stream->update();
 	env_scan();
 }
 
