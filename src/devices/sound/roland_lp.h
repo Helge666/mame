@@ -166,6 +166,11 @@ private:
 	// The rate byte's increment carries six fractional bits: 2^(rate/8) counts the level's
 	// 64ths.  This is the constant the hardware attack times pin down.
 	static constexpr double ENV_RATE_SCALE = 64.0;
+	// `[I]` Falling ramps are too fast and this is the hook for it, deliberately left at 1.
+	// A single divisor does not fit: 4 brings Bell's decay onto hardware almost exactly but
+	// leaves piano and vib 2-3x fast, and does nothing for marimba, which barely decays at
+	// all.  Rather than bake in a number that only works for one tone, see env_segment().
+	static constexpr double ENV_FALL_DIVISOR = 1.0;
 
 
 	double env_level_for(uint8_t log_level) const;

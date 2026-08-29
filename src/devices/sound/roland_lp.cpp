@@ -411,7 +411,18 @@ void mb87419_mb87420_device::env_segment(pcm_channel &chn)
 		return;
 	}
 	// 8.01 counts per doubling, measured; the sign says which way, the magnitude how fast.
-	double const speed = exp2(double(abs(rate)) / 8.0) * ENV_RATE_SCALE;
+	// `[I]` Rising and falling are not symmetric, and only the rise is understood.  The
+	// rising scale is pinned hard by the hardware attack times (emulator 2.142 / 0.518 /
+	// 0.116 s against 2.164 / 0.540 / 0.122 measured), and the firmware's rate bytes have
+	// been checked instruction by instruction and are right -- key 36, scale nibble 12,
+	// 56 - 13 = 43, which is the -43 the decay uses.  Yet the same scale applied downwards
+	// runs the decay about 4x too fast, and no single divisor fixes it (see
+	// ENV_FALL_DIVISOR).  That echoes the hardware measurement that rising ramps are linear
+	// in amplitude while falling ones are exponential, which this does not yet model.
+	double scale = ENV_RATE_SCALE;
+	if (rate < 0)
+		scale /= ENV_FALL_DIVISOR;
+	double const speed = exp2(double(abs(rate)) / 8.0) * scale;
 	chn.env_rate = (rate > 0) ? speed : -speed;
 
 	// A segment that already points the wrong way has nothing to do.  This happens
