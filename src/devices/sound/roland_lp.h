@@ -1,5 +1,5 @@
 // license:BSD-3-Clause
-// copyright-holders:Valley Bell
+// copyright-holders:Valley Bell, Elliott H. Liggett
 #ifndef MAME_SOUND_ROLAND_LP_H
 #define MAME_SOUND_ROLAND_LP_H
 

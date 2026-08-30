@@ -1,5 +1,5 @@
 // license:BSD-3-Clause
-// copyright-holders:Valley Bell
+// copyright-holders:Valley Bell, Elliott H. Liggett
 
 // register write:
 //  00/01 - ??

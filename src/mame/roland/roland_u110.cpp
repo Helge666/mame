@@ -1,5 +1,5 @@
 // license:BSD-3-Clause
-// copyright-holders:
+// copyright-holders:Elliott H. Liggett
 /*************************************************************************************************
 
     Roland U-110 PCM Sound Module (1989)
@@ -175,6 +175,7 @@ public:
 		, m_pcm(*this, "pcm")
 		, m_lpf_sk(*this, "lpf_sk%u", 1U)
 		, m_lpf_rc(*this, "lpf_rc%u", 1U)
+		, m_eq(*this, "eq%u", 1U)
 		, m_lcd(*this, "lcd")
 		, m_cards(*this, "cardslot%u", 1U)
 		, m_pcmrom(*this, "pcm")
@@ -182,6 +183,7 @@ public:
 		, m_sw(*this, "SW")
 		, m_boot_keys(*this, "BOOTKEYS")
 		, m_autotest(*this, "AUTOTEST")
+		, m_eq_enable(*this, "EQ")
 		, m_led(*this, "led%u", 0U)
 	{
 	}
@@ -237,10 +239,22 @@ private:
 
 	static void descramble_pcm(u8 *dst, const u8 *src, size_t len);
 
+	// Measured output EQ correction (see u110(), "Output EQ correction").
+	static constexpr double EQ_FC   = 5933.3;    // Hz
+	static constexpr double EQ_Q    = 1.9306;
+	static constexpr double EQ_GAIN = 0.436787;  // -7.195 dB, multiplicative
+	void update_eq();
+
+public:
+	DECLARE_INPUT_CHANGED_MEMBER(eq_changed);
+
+private:
+
 	required_device<i8x9x_device> m_maincpu;
 	required_device<mb87419_mb87420_device> m_pcm;
 	required_device_array<filter_biquad_device, 4> m_lpf_sk;
 	required_device_array<filter_rc_device, 2> m_lpf_rc;
+	required_device_array<filter_biquad_device, 2> m_eq;
 	required_device<msm6222b_device> m_lcd;
 	required_device_array<generic_slot_device, 4> m_cards;
 	required_region_ptr<u8> m_pcmrom;
@@ -248,6 +262,7 @@ private:
 	required_ioport m_sw;
 	optional_ioport m_boot_keys;
 	optional_ioport m_autotest;
+	optional_ioport m_eq_enable;
 	output_finder<2> m_led;
 
 	emu_timer *m_lcd_timer = nullptr;
@@ -906,6 +921,15 @@ static INPUT_PORTS_START(u110)
 	PORT_CONFNAME(0x10, 0x00, "Sweep steps within that test")
 	PORT_CONFSETTING(   0x00, DEF_STR(Off))
 	PORT_CONFSETTING(   0x10, DEF_STR(On))
+
+	// Switchable while the driver runs, from Tab -> Machine Configuration.  A gain of 1.0
+	// makes MAME's PEAK biquad an exact pass-through (its numerator and denominator become
+	// identical), so "Off" is a true bypass rather than a filter tuned flat.
+	PORT_START("EQ")
+	PORT_CONFNAME(0x01, 0x01, "Output EQ correction")
+			PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(roland_u110_state::eq_changed), 0)
+	PORT_CONFSETTING(   0x00, DEF_STR(Off))
+	PORT_CONFSETTING(   0x01, DEF_STR(On))
 INPUT_PORTS_END
 
 
@@ -924,8 +948,22 @@ void roland_u110_state::machine_start()
 	save_item(NAME(m_leds));
 }
 
+void roland_u110_state::update_eq()
+{
+	const bool on = !m_eq_enable || BIT(m_eq_enable->read(), 0);
+	for (int ch = 0; ch < 2; ch ++)
+		m_eq[ch]->modify(filter_biquad_device::biquad_type::PEAK,
+				EQ_FC, EQ_Q, on ? EQ_GAIN : 1.0);
+}
+
+INPUT_CHANGED_MEMBER(roland_u110_state::eq_changed)
+{
+	update_eq();
+}
+
 void roland_u110_state::machine_reset()
 {
+	update_eq();       // a saved configuration may have switched it off
 	m_patchview.select(0);
 	m_port2 = 0;
 	std::fill(std::begin(m_snd_regs), std::end(m_snd_regs), 0);
@@ -1063,7 +1101,33 @@ void roland_u110_state::u110(machine_config &config)
 
 		m_lpf_sk[ch * 2 + 0]->add_route(0, m_lpf_sk[ch * 2 + 1], 1.0);
 		m_lpf_sk[ch * 2 + 1]->add_route(0, m_lpf_rc[ch], 1.0);
-		m_lpf_rc[ch]->add_route(0, "speaker", 1.0, ch);
+
+		// Output EQ correction -- MEASURED, not modelled, and switchable at runtime under
+		// Tab -> Machine Configuration -> "Output EQ correction".
+		//
+		// Against the hardware captures in listen/3, level-matched over 200 Hz - 2 kHz, the
+		// emulator runs +7.0 dB hot at 6 kHz (analysis/hf_excess.pdf).  The excess is a
+		// broad bell: flat below 2 kHz, peaking at 6-6.5 kHz, back to zero by 10 kHz.  Seven
+		// patches agree within +5.9 to +8.9 dB, and rendering natively at 32 kHz reproduces
+		// it, so it is neither patch-specific nor a resampling artefact.  It sits on real
+		// signal rather than added noise: on a sustained note the harmonic peaks and the
+		// valleys between them rise together, the comb contrast dropping only 24.3 -> 22.2 dB.
+		//
+		// One RBJ peaking cut cancels it to a weighted rms residual of 0.53 dB, and across
+		// ten patches it takes the 300 Hz - 10 kHz error from 2.83 dB rms to 1.20 dB.  Bass
+		// is deliberately untouched: below 200 Hz the two already agree to 0.1 dB, so the
+		// thin bottom end one hears is the treble excess, not a missing octave.
+		//
+		// `[I]` This is a CORRECTION LAYER, not the physics.  The Sallen-Key chain above is
+		// the more likely culprit: as modelled it peaks +4.29 dB at 6065 Hz, where the
+		// service notes' own simulation of the same circuit says +2.17 dB max -- twice the
+		// resonance, in the same place as the measured error.  Fixing that is the real
+		// repair; this filter is what makes the emulator match the hardware in the meantime.
+		// Switch it off to hear the raw chain, or when working on the chain itself.
+		FILTER_BIQUAD(config, m_eq[ch]).setup(
+				filter_biquad_device::biquad_type::PEAK, EQ_FC, EQ_Q, EQ_GAIN);
+		m_lpf_rc[ch]->add_route(0, m_eq[ch], 1.0);
+		m_eq[ch]->add_route(0, "speaker", 1.0, ch);
 	}
 
 	GENERIC_CARTSLOT(config, m_cards[0], generic_romram_plain_slot, "u110_card", "bin")
