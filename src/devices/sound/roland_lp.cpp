@@ -145,32 +145,37 @@ u8 mb87419_mb87420_device::read(offs_t offset)
 				// the sustain handler at 0xBE99 has to `clrb` that byte to get a rate of
 				// zero, which only makes sense if it is normally non-zero.  Returning 0 here
 				// left every release a single segment followed by a permanent hold.
-				// `[I]` INFERRED, not measured: while a ramp is still travelling this hands
-				// back the level it is HEADING TO, not the level it has reached.
+				// Select 0x16 hands back the voice's SEGMENT REGISTER PAIR verbatim -- the
+				// target level in the high byte, the ramp rate in the low.  Nothing is
+				// computed here; this is a read-back of what the CPU wrote.
 				//
-				// The firmware refines every segment a moment after writing it, adding
-				// (reported - target)/2 to the rate at 0x42D0-0x42EB.  Reporting the
-				// instantaneous level makes that term +8 -- one whole rung of the rate
-				// ladder, so half the decay speed -- for any segment whose target sits 16
-				// units below the current level.  Tones that write such a segment measured
-				// 52-76% slow against hardware; tones that do not were already right.
+				// The firmware says so at 0x7655.  That routine selects 0x16, reads it,
+				// DISCARDS the value, then selects 0x10 and 0x12, glues the low 16 and high
+				// 10 bits of the LINEAR level together, and derives the logarithm itself:
 				//
-				// Scored over listen/hardware/env3 (76 trials, tools/scratch_analyse.py):
-				// mean absolute error 28.5% -> 15.3%, worst segment 65% -> 34%, Fretless
-				// Bass 53% -> 12%, and every segment that was already correct stayed so.
+				//     7690: shlb 40, #04     shift count << 4   -> exponent
+				//     7693: shrb 47, #03
+				//     7696: andb 47, #0f                        -> 4-bit mantissa
+				//     7699: orb  40, 47      16 units per octave
 				//
-				// What is NOT settled is what the chip really returns here.  This is the
-				// cheapest thing a 1988 gate array could offer -- the register the CPU last
-				// wrote -- but a lagged or coarsely-updated level would look similar.  Bell
-				// is still 62% FAST and is untouched by this, so at least one more fault
-				// lives in the same area.
-				double const rep = (m_chns[m_status_voice].env_rate != 0.0)
-						? m_chns[m_status_voice].env_target : double(level);
-				u8 log_level = 0;
-				if (rep > 0.0)
-					log_level = (u8)std::clamp(
-							(int)lround(16.0 * log2(rep / ENV_FULL) + 255.0), 1, 255);
-				value = (u16(log_level) << 8) | (m_chns[m_status_voice].volume & 0x00FF);
+				// If 0x16 already carried a log level that routine would use it instead of
+				// paying for the normalise, so it does not carry one -- and a gate array
+				// driving 31 voices in 1988 has no business computing log2 in the first
+				// place.  The discarded read is there for its side effect: it latches the
+				// level so the 0x10/0x12 pair cannot tear while a ramp is running.
+				//
+				// This matters because the ladder handler at 0x42D0 folds
+				// (reported - target)/2 into every segment's rate.  Computing a log of the
+				// INSTANTANEOUS level made that term +8 -- one whole rung, so half the decay
+				// speed -- for any segment whose target sat 16 units below the current
+				// level.  Scored over listen/hardware/env3 (76 trials,
+				// tools/scratch_analyse.py) returning the register pair takes the mean
+				// absolute error from 28.5% to 14.1%, the worst segment from 65% to 33%,
+				// Fretless Bass from 53% to 12% and VELO SENS from 21% to 11%.
+				//
+				// `[I]` Bell 1 still decays 62% FAST and is untouched by this, so at least
+				// one more fault lives nearby.
+				value = m_chns[m_status_voice].volume;
 			}
 			break;
 		}
