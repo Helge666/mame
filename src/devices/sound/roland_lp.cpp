@@ -145,10 +145,31 @@ u8 mb87419_mb87420_device::read(offs_t offset)
 				// the sustain handler at 0xBE99 has to `clrb` that byte to get a rate of
 				// zero, which only makes sense if it is normally non-zero.  Returning 0 here
 				// left every release a single segment followed by a permanent hold.
+				// `[I]` INFERRED, not measured: while a ramp is still travelling this hands
+				// back the level it is HEADING TO, not the level it has reached.
+				//
+				// The firmware refines every segment a moment after writing it, adding
+				// (reported - target)/2 to the rate at 0x42D0-0x42EB.  Reporting the
+				// instantaneous level makes that term +8 -- one whole rung of the rate
+				// ladder, so half the decay speed -- for any segment whose target sits 16
+				// units below the current level.  Tones that write such a segment measured
+				// 52-76% slow against hardware; tones that do not were already right.
+				//
+				// Scored over listen/hardware/env3 (76 trials, tools/scratch_analyse.py):
+				// mean absolute error 28.5% -> 15.3%, worst segment 65% -> 34%, Fretless
+				// Bass 53% -> 12%, and every segment that was already correct stayed so.
+				//
+				// What is NOT settled is what the chip really returns here.  This is the
+				// cheapest thing a 1988 gate array could offer -- the register the CPU last
+				// wrote -- but a lagged or coarsely-updated level would look similar.  Bell
+				// is still 62% FAST and is untouched by this, so at least one more fault
+				// lives in the same area.
+				double const rep = (m_chns[m_status_voice].env_rate != 0.0)
+						? m_chns[m_status_voice].env_target : double(level);
 				u8 log_level = 0;
-				if (level)
+				if (rep > 0.0)
 					log_level = (u8)std::clamp(
-							(int)lround(16.0 * log2(double(level) / ENV_FULL) + 255.0), 1, 255);
+							(int)lround(16.0 * log2(rep / ENV_FULL) + 255.0), 1, 255);
 				value = (u16(log_level) << 8) | (m_chns[m_status_voice].volume & 0x00FF);
 			}
 			break;
@@ -531,6 +552,22 @@ static inline uint32_t volume_gain(uint16_t vol)
 }
 
 //-------------------------------------------------
+//  set_mix_gain_db - output gain, applied where a
+//  voice joins the mix
+//-------------------------------------------------
+
+void mb87419_mb87420_device::set_mix_gain_db(double db)
+{
+	// Everything already rendered was rendered at the old gain, so flush first: without
+	// this an adjustment made mid-block retroactively rescales the block.
+	if (m_stream != nullptr)
+		m_stream->update();
+	m_out_gain_db = db;
+	m_out_scale = pow(10.0, db / 20.0) / VOICE_FS;
+}
+
+
+//-------------------------------------------------
 //  sound_stream_update - handle a stream update
 //-------------------------------------------------
 
@@ -597,11 +634,16 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 					break;
 				}
 			}
+			// Scale ONCE, here, where smp_data is still the full-width integer product
+			// of the decoded sample and the envelope multiplier.  m_out_scale is
+			// gain / VOICE_FS -- see VOICE_FS in the header for where 2^27 comes from,
+			// and set_mix_gain_db() for the gain.
+			auto const out_smp = sound_stream::sample_t(double(smp_data) * m_out_scale);
 			if (m_out_count <= 2)
 			{
 				// historical behaviour: every voice to both channels
-				stream.add_int(0, smpl, smp_data, 32768 << 14); // >>14 results in a good overall volume
-				stream.add_int(1, smpl, smp_data, 32768 << 14);
+				stream.add(0, smpl, out_smp);
+				stream.add(1, smpl, out_smp);
 			}
 			else
 			{
@@ -610,7 +652,7 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 				u8 const mask = m_voice_mask[&chn - &m_chns[0]];
 				for (int out = 0; out < m_out_count; out ++)
 					if (BIT(mask, out))
-						stream.add_int(out, smpl, smp_data, 32768 << 14);
+						stream.add(out, smpl, out_smp);
 			}
 
 			uint32_t old_addr = chn.addr;

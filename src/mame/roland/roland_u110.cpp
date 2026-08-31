@@ -72,17 +72,27 @@
       - panel navigation, LEDs, NVRAM persistence, all four card slots
       - MIDI in via a bit-level UART receiver; -min file.mid works
 
-    Sample format: LINEAR 8-BIT TWO'S COMPLEMENT PCM.  Settled by correlating decodes
-    against a hardware recording -- direct PCM matches at r=0.76, the differential reading
-    MAME uses for the CM-32P at 0.26.  Selected here with set_pcm_mode(PCM_FLOAT8); the
-    device keeps its historical behaviour for the CM-32P.
+    Sample format: 8-BIT DELTAS, INTEGRATED BY THE CHIP.  Selected with
+    set_pcm_mode(PCM_FLOAT8_DELTA) and set_delta_dc_hz(0.0); the device keeps its
+    historical behaviour for the CM-32P.  The reasoning is at the set_pcm_mode() call in
+    u110() -- integration explains the 6 dB/octave the ROM sits above the U-110's output,
+    it welds a ping-pong loop (what reverses is the SLOPE, so the amplitude never jumps),
+    and it removes any need for a separate de-emphasis filter.
+
+    `[I]` An earlier reading of this file said "LINEAR 8-BIT TWO'S COMPLEMENT PCM ...
+    selected here with set_pcm_mode(PCM_FLOAT8)", from correlating decodes against a
+    hardware recording (sample 89: direct PCM r=0.76 against 0.26 differential).  That
+    conclusion was superseded and the code has said PCM_FLOAT8_DELTA for some time; the
+    correlation test could not tell the two apart, because a sine's derivative is a sine.
+    The stale text is recorded here only because it cost an investigation: read the
+    set_pcm_mode() call, not this summary, when the decode is in question.
 
     Engine rate: 34.816 MHz / 1088 = 32000 Hz.  The crystal is confirmed on the schematic
     (p.13, IC15 pins 79/80); it is the divisor that differs from the CM-32P, not the
     oscillator.  With MAME's /1024 the emulator ran +104 cents sharp, and
     1200*log2(34000/32000) = +104.96.  Set with set_rate_divider(1088).
 
-    Three fixes were needed outside this driver:
+    Four fixes were needed outside this driver:
       1. i8x9x.cpp gated the HSI.0 interrupt on IOC1 bit 1.  This firmware sets IOC1 = 0x21
          (bit 1 clear, EXTINT on the pin for the sound chip) while enabling INT_MASK bit 4
          for HSI.0 from IC8, so the two were mutually exclusive, the LCD text ring at 0x2700
@@ -91,6 +101,16 @@
       2. roland_lp.cpp gained set_pcm_mode() and set_rate_divider(), both defaulting to the
          CM-32P behaviour.
       3. 34.816 MHz added to emu/xtal.cpp.
+      4. emu/sound.cpp and emu/resampler.cpp ROUND and TPDF-DITHER the float-to-s16
+         conversions instead of truncating them.  MAME mixes in float and meets 16-bit
+         integers at every hand-off to the OSD and at -wavwrite; `int(x * 32768)` truncates
+         toward zero, which doubles the dead zone around silence, leaves a DC bias and makes
+         the quantisation error correlated with the signal.  Measured on a U-110 fade 75 dB
+         down, that is 16 dB of quantisation junk that dither removes, for 4.7 dB of added
+         broadband noise.  Digital black is passed through undithered, so silence stays
+         silent.  The switch is `audio_dither_enabled()` in emu/sound.h; it defaults ON.
+         This one is core MAME, not a device, so it affects every driver and it does NOT
+         reach the plugin -- the plugin hands float to its host and has no s16 stage at all.
 
     KNOWN DEFECT
     ------------
@@ -165,6 +185,27 @@ constexpr u8 UNSCRAMBLE_DATA(u8 data)
 // does the same thing.  If cards refuse to mount but internal banks read fine, try 0.
 constexpr int PCM_READ_PREFETCH = 2;
 
+// Output gain.  The U-110's own scaling is quiet -- a single max-velocity note on a
+// sustained tone with part level 127 peaks around -16 dBFS even after the sound device's
+// 12 dB calibration fix (see VOICE_FS in roland_lp.h), because the firmware asks the chip
+// for a sustain level of 0xDB, 13.5 dB below its full scale, to leave room for 31 voices.
+// Real behaviour, but on a modern output it is quiet, so the gain is exposed rather than
+// baked in.
+//
+// Measured worst cases at 0 dB (E. Organ 1, velocity 127, CC7 127, sustained cluster):
+//
+//     1 note   -15.8 dBFS      8 notes   -4.5 dBFS
+//     2 notes  -10.9 dBFS     12 notes   -1.6 dBFS
+//     4 notes   -7.1 dBFS     16 notes   -0.9 dBFS
+//
+// so 0 dB is as loud as this can be without a dense cluster clipping the 16-bit output.
+// Ordinary playing has headroom to spare; +6 dB is comfortable up to about eight notes.
+constexpr int GAIN_STEPS   = 16;
+constexpr int GAIN_MIN_DB  = -9;
+constexpr int GAIN_STEP_DB = 3;
+constexpr int GAIN_DEFAULT = 3;                 // index of 0 dB
+constexpr int gain_db_for(int idx) { return GAIN_MIN_DB + GAIN_STEP_DB * idx; }
+
 
 class roland_u110_state : public driver_device
 {
@@ -184,6 +225,7 @@ public:
 		, m_boot_keys(*this, "BOOTKEYS")
 		, m_autotest(*this, "AUTOTEST")
 		, m_eq_enable(*this, "EQ")
+		, m_gain(*this, "GAIN")
 		, m_led(*this, "led%u", 0U)
 	{
 	}
@@ -245,8 +287,12 @@ private:
 	static constexpr double EQ_GAIN = 0.436787;  // -7.195 dB, multiplicative
 	void update_eq();
 
+	void update_gain(bool announce);
+
 public:
 	DECLARE_INPUT_CHANGED_MEMBER(eq_changed);
+	DECLARE_INPUT_CHANGED_MEMBER(gain_changed);
+	DECLARE_INPUT_CHANGED_MEMBER(gain_key);
 
 private:
 
@@ -263,6 +309,7 @@ private:
 	optional_ioport m_boot_keys;
 	optional_ioport m_autotest;
 	optional_ioport m_eq_enable;
+	optional_ioport m_gain;
 	output_finder<2> m_led;
 
 	emu_timer *m_lcd_timer = nullptr;
@@ -930,6 +977,41 @@ static INPUT_PORTS_START(u110)
 			PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(roland_u110_state::eq_changed), 0)
 	PORT_CONFSETTING(   0x00, DEF_STR(Off))
 	PORT_CONFSETTING(   0x01, DEF_STR(On))
+
+	// Output gain.  Adjustable three ways, all of which move the SAME setting, so the
+	// menu always shows what the keys did and MAME persists it to cfg/u110.cfg:
+	//
+	//   * Tab -> Machine Configuration -> "Output gain";
+	//   * the "Volume Down" / "Volume Up" inputs, `-` and `=` by default and remappable
+	//     under Tab -> Input Settings, which is the one that works while live MIDI is
+	//     playing;
+	//   * mb87419_mb87420_device::set_mix_gain_db(), for a host that has no MAME UI.
+	//
+	// The gain is applied inside the sound device at the point a voice joins the mix, so
+	// nothing downstream is being asked to amplify an already-quiet signal.
+	PORT_START("GAIN")
+	PORT_CONFNAME(0x0f, GAIN_DEFAULT, "Output gain")
+			PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(roland_u110_state::gain_changed), 0)
+	PORT_CONFSETTING(   0x00, "-9 dB")
+	PORT_CONFSETTING(   0x01, "-6 dB")
+	PORT_CONFSETTING(   0x02, "-3 dB")
+	PORT_CONFSETTING(   0x03, "+0 dB")
+	PORT_CONFSETTING(   0x04, "+3 dB")
+	PORT_CONFSETTING(   0x05, "+6 dB")
+	PORT_CONFSETTING(   0x06, "+9 dB")
+	PORT_CONFSETTING(   0x07, "+12 dB")
+	PORT_CONFSETTING(   0x08, "+15 dB")
+	PORT_CONFSETTING(   0x09, "+18 dB")
+	PORT_CONFSETTING(   0x0a, "+21 dB")
+	PORT_CONFSETTING(   0x0b, "+24 dB")
+	PORT_CONFSETTING(   0x0c, "+27 dB")
+	PORT_CONFSETTING(   0x0d, "+30 dB")
+	PORT_CONFSETTING(   0x0e, "+33 dB")
+	PORT_CONFSETTING(   0x0f, "+36 dB")
+	PORT_BIT(0x10, IP_ACTIVE_HIGH, IPT_VOLUME_DOWN) PORT_NAME("Output gain -3 dB")
+			PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(roland_u110_state::gain_key), 0)
+	PORT_BIT(0x20, IP_ACTIVE_HIGH, IPT_VOLUME_UP)   PORT_NAME("Output gain +3 dB")
+			PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(roland_u110_state::gain_key), 1)
 INPUT_PORTS_END
 
 
@@ -961,9 +1043,47 @@ INPUT_CHANGED_MEMBER(roland_u110_state::eq_changed)
 	update_eq();
 }
 
+void roland_u110_state::update_gain(bool announce)
+{
+	int const idx = m_gain ? int(m_gain->read() & 0x0f) : GAIN_DEFAULT;
+	int const db  = gain_db_for(idx);
+	m_pcm->set_mix_gain_db(double(db));
+	if (announce)
+		popmessage("Output gain %+d dB", db);
+}
+
+INPUT_CHANGED_MEMBER(roland_u110_state::gain_changed)
+{
+	update_gain(false);       // the menu already shows the new setting
+}
+
+// One step of the same configuration field the menu edits, so the two never disagree and
+// the choice is saved with the rest of the configuration.  select_next_setting() would be
+// shorter but it WRAPS, which on a gain control means one keypress too many drops you from
+// +36 dB to -9 dB; this clamps instead.
+INPUT_CHANGED_MEMBER(roland_u110_state::gain_key)
+{
+	if (!newval || !m_gain)
+		return;
+	ioport_field *const f = m_gain->field(0x0f);
+	if (f == nullptr)
+		return;
+
+	ioport_field::user_settings settings;
+	f->get_user_settings(settings);
+	int const idx = std::clamp(int(settings.value) + (param ? +1 : -1), 0, GAIN_STEPS - 1);
+	if (ioport_value(idx) != settings.value)
+	{
+		settings.value = ioport_value(idx);
+		f->set_user_settings(settings);
+	}
+	update_gain(true);
+}
+
 void roland_u110_state::machine_reset()
 {
 	update_eq();       // a saved configuration may have switched it off
+	update_gain(false);   // ...and may carry a saved output gain
 	m_patchview.select(0);
 	m_port2 = 0;
 	std::fill(std::begin(m_snd_regs), std::end(m_snd_regs), 0);
@@ -1034,13 +1154,13 @@ void roland_u110_state::u110(machine_config &config)
 	// it arrives, and the handler at 0x41C4 writes the next segment.  Everything the
 	// U-110's own parameters reach -- ENV ATTACK RATE, ENV RELEASE RATE, key scaling, the
 	// per-tone decay shapes -- comes along with it, because it is the real code running.
-	// Calibrated against listen/env and listen/env2; see listen/env/ANALYSIS.md.
+	// Calibrated against listen/hardware/env and listen/hardware/env2; see listen/hardware/env/ANALYSIS.md.
 	// ON.  The chip ramps a level and interrupts when it arrives; the firmware's handler at
 	// 0x41C4 writes the next segment.  Everything the instrument's own parameters reach --
 	// ENV ATTACK RATE, ENV RELEASE RATE, key scaling, the per-tone decay shapes -- comes
 	// along with it, because it is the real code running.
 	//
-	// Measured against listen/env and listen/env2 (tools/capture_env.py):
+	// Measured against listen/hardware/env and listen/hardware/env2 (tools/capture_env.py):
 	//   * attack, Vib 1: 2.162 / 0.516 / 0.122 / 0.018 s against 2.164 / 0.540 / 0.122 /
 	//     0.018 on hardware;
 	//   * release, E. Organ 1 and Choir 3: a constant 0.92-0.94x across 125x of rate, both
@@ -1050,7 +1170,7 @@ void roland_u110_state::u110(machine_config &config)
 	//     piano 0.63/1.17/5.71 against 0.64/1.14/5.07, fbass 1.07/2.16/4.36 against
 	//     1.05/2.10/4.18.
 	//
-	// And across the whole listen/3 reference session: sixteen of seventeen segments
+	// And across the whole listen/hardware/3 reference session: sixteen of seventeen segments
 	// allocate voices identically to the old stand-in, and the dB envelope correlates
 	// 0.79-0.95 with the hardware recording segment for segment.
 	m_pcm->set_env_engine(ENV_ENGINE);
@@ -1105,7 +1225,7 @@ void roland_u110_state::u110(machine_config &config)
 		// Output EQ correction -- MEASURED, not modelled, and switchable at runtime under
 		// Tab -> Machine Configuration -> "Output EQ correction".
 		//
-		// Against the hardware captures in listen/3, level-matched over 200 Hz - 2 kHz, the
+		// Against the hardware captures in listen/hardware/3, level-matched over 200 Hz - 2 kHz, the
 		// emulator runs +7.0 dB hot at 6 kHz (analysis/hf_excess.pdf).  The excess is a
 		// broad bell: flat below 2 kHz, peaking at 6-6.5 kHz, back to zero by 10 kHz.  Seven
 		// patches agree within +5.9 to +8.9 dB, and rendering natively at 32 kHz reproduces

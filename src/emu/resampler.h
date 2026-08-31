@@ -39,6 +39,11 @@ public:
 	virtual void apply_add(const emu::detail::output_buffer_flat<sample_t> &src, std::vector<s16> &dest, u32 destc, int dchannels, u64 dest_sample, u32 srcc, float gain, u32 samples) const override;
 
 private:
+	// Output quantisation -- see audio_dither in sound.h.  Mutable because
+	// apply_copy()/apply_add() are const; they are only ever called from the
+	// effects thread, one after another, so the state is not shared across threads.
+	mutable audio_dither m_dither{0x1d872b41u};
+
 	u32 m_order_per_lane, m_ftm, m_fsm, m_ft, m_fs, m_delta, m_skip, m_phases, m_phase_shift;
 
 	std::vector<std::vector<float>> m_coefficients;
@@ -60,6 +65,11 @@ public:
 	virtual void apply_add(const emu::detail::output_buffer_flat<sample_t> &src, std::vector<s16> &dest, u32 destc, int dchannels, u64 dest_sample, u32 srcc, float gain, u32 samples) const override;
 
 private:
+	// Output quantisation -- see audio_dither in sound.h.  Mutable because
+	// apply_copy()/apply_add() are const; they are only ever called from the
+	// effects thread, one after another, so the state is not shared across threads.
+	mutable audio_dither m_dither{0xc2b2ae35u};
+
 	static const std::array<std::array<float, 0x1001>, 2> interpolation_table;
 	u32 m_source_divide, m_fs, m_ft;
 	u32 m_step;

@@ -334,7 +334,7 @@ void sound_manager::output_push(int id, sound_stream &stream)
 		s16 *outb1 = outb;
 		const float *inb = inp[channel].data();
 		for(int sample = 0; sample != samples; sample++) {
-			*outb1 = std::clamp(int(*inb++ * 32768), -32768, 32767);
+			*outb1 = m_dither_record.quantise(*inb++ * 32768);
 			outb1 += m_outputs_count;
 		}
 		outb++;
@@ -447,7 +447,7 @@ void sound_manager::run_effects()
 				case mixing_step::COPY: {
 					float gain = 32768 * step.m_linear_volume * m_master_gain;
 					for(u32 sample = 0; sample != source_samples; sample++) {
-						*dest = std::clamp(int(*src++ * gain), -32768, 32767);
+						*dest = m_dither_osd.quantise(*src++ * gain);
 						dest += skip;
 					}
 					break;
@@ -456,7 +456,7 @@ void sound_manager::run_effects()
 				case mixing_step::ADD: {
 					float gain = 32768 * step.m_linear_volume * m_master_gain;
 					for(u32 sample = 0; sample != source_samples; sample++) {
-						*dest = std::clamp(int(*src++ * gain) + *dest, -32768, 32767);
+						*dest = m_dither_osd.quantise_add(*src++ * gain, *dest);
 						dest += skip;
 					}
 					break;

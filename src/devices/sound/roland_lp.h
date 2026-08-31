@@ -96,6 +96,18 @@ public:
 	// the same 32 kHz from 34.816 MHz / 1088, measured against real hardware.
 	void set_rate_divider(u32 div) { m_rate_div = div; }
 
+	// Output gain, in dB, applied at the point where a voice joins the mix -- see
+	// VOICE_FS and sound_stream_update().  This is the ONE place a level adjustment
+	// belongs: `smp_data` there is a full-width s32 carrying the decoded sample times
+	// the 16-bit envelope multiplier, so scaling it costs no precision.  Applying gain
+	// on the device's output ROUTE instead would amplify a number that has already been
+	// divided down to a float, which is a different and worse thing.
+	//
+	// 0 dB is the calibrated default: one voice at full envelope with a full-scale
+	// decoded sample reaches digital full scale exactly.
+	void set_mix_gain_db(double db);
+	double mix_gain_db() const { return m_out_gain_db; }
+
 	u8 read(offs_t offset);
 	void write(offs_t offset, u8 data);
 
@@ -173,6 +185,23 @@ private:
 	// emulator both double cleanly step for step over that range.
 	static constexpr double ENV_FALL_DIVISOR = 16.0;
 
+	// Full-scale magnitude of ONE voice at the summing point, i.e. what
+	// sound_stream_update() must divide by for that voice to reach +/-1.0.
+	//
+	//   decode_sample() spans -2048..+1984: the largest code, 0x80, gives
+	//   (0x10 + 0) << 7 = 2048, and every other code is smaller.  Measured content
+	//   agrees -- E. Organ 1 at note 60 peaks around +/-2200 after interpolation.
+	//   (PCM_FLOAT8_DELTA clamps its accumulator at +/-8191, but that is an overflow
+	//   guard on a runaway DC walk, not the range real wave-ROM data occupies.)
+	//
+	//   The envelope multiplier below it tops out at 65536 (env_level == ENV_FULL,
+	//   and volume_gain()'s table at 65535).
+	//
+	// so 2048 * 65536 = 2^27.  The code here divided by 32768 << 14 = 2^29 instead, as
+	// though the decoded sample used a full 16-bit range -- which threw away exactly
+	// 12.04 dB and left a loud single note peaking near -28 dBFS.
+	static constexpr double VOICE_FS = 2048.0 * 65536.0;
+
 
 	double env_level_for(uint8_t log_level) const;
 	void env_segment(pcm_channel &chn);
@@ -196,6 +225,8 @@ private:
 	double m_env_decay = 0.0;           // dB/s while the key is held
 	double m_env_release_step = 1.0;    // per-sample multipliers, derived from the above
 	double m_env_decay_step = 1.0;
+	double m_out_gain_db = 0.0;         // user output gain, dB
+	double m_out_scale = 1.0 / VOICE_FS;  // gain folded into the 1/VOICE_FS divisor
 
 	// envelope ramp generator
 	bool m_env_engine = false;
