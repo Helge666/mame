@@ -536,7 +536,16 @@ double mb87419_mb87420_device::env_level_for(uint8_t log_level) const
 // One write of the volume word is one envelope segment: where to go, and how fast.
 void mb87419_mb87420_device::env_segment(pcm_channel &chn)
 {
+	unsigned const slot = unsigned(&chn - &m_chns[0]);
 	chn.env_target = env_level_for(chn.volume >> 8);
+
+	// For the two LFO slots, remember where this segment starts as well as where it ends.
+	// The effect stage's right channel wants the complement of the level about the two
+	// endpoints, and on hardware both are in front of the chip at once; here only one is,
+	// so the sum is kept as the segment is written.  Ignore the very first segment of all,
+	// which starts from a level of zero and would give a meaningless sum.
+	if (slot >= NUM_CHANNELS && chn.env_level > 0.0)
+		m_fx_endsum[slot - NUM_CHANNELS] = chn.env_target + chn.env_level;
 
 	int const rate = (int8_t)(chn.volume & 0xFF);    // SIGNED: + rises, - falls
 	if (! rate)
@@ -554,7 +563,14 @@ void mb87419_mb87420_device::env_segment(pcm_channel &chn)
 	// ENV_FALL_DIVISOR).  That echoes the hardware measurement that rising ramps are linear
 	// in amplitude while falling ones are exponential, which this does not yet model.
 	double scale = ENV_RATE_SCALE;
-	if (rate < 0)
+	// The two LFO slots take the falling constant WHICHEVER WAY THEY ARE GOING, so their
+	// ramp is a symmetric triangle rather than the 1/17-duty sawtooth a voice's asymmetry
+	// would make.  Measured: duty 0.47-0.54 across the tremolo sweep, and fitting the scale
+	// to eighteen trials spanning a 44:1 range of period gives a flat 3.95-4.29 against the
+	// 64 a rising voice ramp uses.  Why the two differ is open -- see analysis/EFFECTS.md
+	// section 10 -- and it is a live question for the voices too, because it is evidence
+	// that the 16:1 is not really about ramp direction.
+	if (rate < 0 || slot >= NUM_CHANNELS)
 		scale /= ENV_FALL_DIVISOR;
 	double const speed = exp2(double(abs(rate)) / 8.0) * scale;
 	chn.env_rate = (rate > 0) ? speed : -speed;
@@ -654,10 +670,19 @@ void mb87419_mb87420_device::env_scan()
 // The two LFO slots never reach the audio loop -- nothing ever sets their enable bit and
 // they carry no sample -- but their ramps still have to run, because the alternation the
 // firmware performs when one arrives IS the chorus or tremolo waveform.
-void mb87419_mb87420_device::env_advance_slot(pcm_channel &chn, unsigned slot, int samples)
+// `trace`, when given, receives the level at every sample of the block -- the effect stage
+// needs the LFO sample by sample, not once per block.
+void mb87419_mb87420_device::env_advance_slot(pcm_channel &chn, unsigned slot, int samples,
+		std::vector<double> *trace)
 {
-	while (samples -- > 0 && chn.env_rate != 0.0)
+	if (trace)
+		trace->clear();
+	for (int i = 0; i < samples; i ++)
 	{
+		if (trace)
+			trace->push_back(chn.env_level);
+		if (chn.env_rate == 0.0)
+			continue;
 		chn.env_level += chn.env_rate;
 		if ((chn.env_rate > 0.0 && chn.env_level >= chn.env_target)
 				|| (chn.env_rate < 0.0 && chn.env_level <= chn.env_target))
@@ -665,8 +690,74 @@ void mb87419_mb87420_device::env_advance_slot(pcm_channel &chn, unsigned slot, i
 			chn.env_level = chn.env_target;
 			chn.env_rate = 0.0;
 			env_arrived(slot);
-			break;
+			// The CPU cannot answer until the next timer tick, so the ramp simply sits at
+			// its target for the rest of the block.  That is what the hardware does too:
+			// the flat spots at the top and bottom of the triangle are real, and short.
 		}
+	}
+}
+
+// -------------------------------------------------------------------------------------
+// The effect stage: chorus and tremolo, on Voice Group 1.
+//
+// Both are one LFO each, and both put the LFO on the LEFT output and its COMPLEMENT on the
+// right.  Measured on hardware (analysis/EFFECTS.md section 8):
+//
+//   * TREMOLO is an auto-pan.  The two channels sum to a constant -- the sum does not move
+//     with depth at all, 8.9 dB of the tone's own ripple at depth 7 and the same 8.9 dB at
+//     depth 15, while each channel alone goes from 14.9 to 30.9 dB.
+//   * CHORUS is a delay line with a tap in EACH channel, and the two taps sweep in exactly
+//     opposite directions: tracking which sideband is the stronger one, 50 ms at a time,
+//     the two channels correlate at -1.000.  It is not a polarity flip -- an inversion
+//     would have made L+R cancel the wet, and L+R leaves it 4 dB down while L-R kills the
+//     dry carrier by 32.
+//
+// The tap is an integer sample offset, not interpolated: IC17 is addressed by eleven wires
+// and there is nothing in between two of its bytes.  The small step the tap makes as it
+// crosses a sample boundary is part of the sound.
+// -------------------------------------------------------------------------------------
+void mb87419_mb87420_device::fx_render(sound_stream &stream)
+{
+	bool const chorus = BIT(m_fx_config, 3);
+	bool const tremolo = BIT(m_fx_config, 1);
+	double const csum = m_fx_endsum[0];
+	double const tsum = m_fx_endsum[1];
+
+	for (int smpl = 0; smpl < stream.samples(); smpl ++)
+	{
+		auto const dry = m_fx_bus[smpl];
+		m_fx_line[m_fx_pos] = float(dry);
+
+		auto wet_l = dry, wet_r = dry;
+		if (chorus && csum > 0.0)
+		{
+			double const g = m_fx_lfo[0][smpl];
+			u32 const dl = std::clamp<u32>(u32(g / double(1u << FX_TAP_SHIFT)),
+					1, FX_DELAY_LEN - 1);
+			u32 const dr = std::clamp<u32>(u32(std::max(csum - g, 0.0) / double(1u << FX_TAP_SHIFT)),
+					1, FX_DELAY_LEN - 1);
+			wet_l += sound_stream::sample_t(FX_CHORUS_MIX
+					* m_fx_line[(m_fx_pos - dl) & (FX_DELAY_LEN - 1)]);
+			wet_r += sound_stream::sample_t(FX_CHORUS_MIX
+					* m_fx_line[(m_fx_pos - dr) & (FX_DELAY_LEN - 1)]);
+		}
+		if (tremolo && tsum > 0.0)
+		{
+			// The pan gains are the LFO and its complement, each divided by their SUM -- so
+			// they add to one, and each channel sits at half the signal in the middle of the
+			// sweep.  Not normalised to unity at the centre, which is what I first wrote:
+			// the FIRMWARE already compensates for the halving.  With the tremolo on it asks
+			// for volume F278 instead of E270 -- log target 242 against 226, and 16 units is
+			// exactly one octave.  Putting a factor of two here as well made every tremolo
+			// patch 6 dB loud, and it is the firmware's own correction that says the pan
+			// really does divide the signal rather than modulate it about unity.
+			double const g = m_fx_lfo[1][smpl];
+			wet_l = sound_stream::sample_t(wet_l * (g / tsum));
+			wet_r = sound_stream::sample_t(wet_r * (std::max(tsum - g, 0.0) / tsum));
+		}
+		stream.add(0, smpl, wet_l);
+		stream.add(1, smpl, wet_r);
+		m_fx_pos = (m_fx_pos + 1) & (FX_DELAY_LEN - 1);
 	}
 }
 
@@ -735,9 +826,24 @@ void mb87419_mb87420_device::set_mix_gain_db(double db)
 
 void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 {
+	// The effect stage runs when the firmware has said so -- register 0x1D, written at patch
+	// load from the OUTPUT MODE's own config byte.  Bit 3 is chorus, bit 1 tremolo, and the
+	// firmware clears whichever one has a depth of zero, so "depth 0" arrives here as "off"
+	// rather than as a small effect.
+	bool const fx_on = m_env_engine && m_out_count > 2
+			&& (BIT(m_fx_config, 1) || BIT(m_fx_config, 3));
+
 	if (m_env_engine)
 		for (unsigned slot = NUM_CHANNELS; slot < NUM_SLOTS; slot ++)
-			env_advance_slot(m_chns[slot], slot, stream.samples());
+			env_advance_slot(m_chns[slot], slot, stream.samples(),
+					fx_on ? &m_fx_lfo[slot - NUM_CHANNELS] : nullptr);
+
+	if (fx_on)
+	{
+		m_fx_bus.assign(stream.samples(), sound_stream::sample_t(0));
+		if (m_fx_line.size() != FX_DELAY_LEN)
+			m_fx_line.assign(FX_DELAY_LEN, 0.0f);
+	}
 
 	for (auto& chn : m_chns)
 	{
@@ -887,9 +993,16 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 				// one stream per Multi Output; a voice may feed several (a centred group
 				// carries mask 0x03, i.e. Multi Outputs 1 and 2 together)
 				u8 const mask = m_voice_mask[&chn - &m_chns[0]];
-				for (int out = 0; out < m_out_count; out ++)
-					if (BIT(mask, out))
-						stream.add(out, smpl, out_smp);
+				// Voice Group 1 is the only group the effect section touches, and in the
+				// modes that have an effect it is exactly the voices carrying mask 0x03.
+				// Those are summed onto one bus here and reach Multi Outputs 1 and 2
+				// through fx_render() instead.
+				if (fx_on && mask == 0x03)
+					m_fx_bus[smpl] += out_smp;
+				else
+					for (int out = 0; out < m_out_count; out ++)
+						if (BIT(mask, out))
+							stream.add(out, smpl, out_smp);
 			}
 
 			uint32_t old_addr = chn.addr;
@@ -1135,7 +1248,10 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 		}
 	}
 
-	return;
+	// Group 1 has been summed onto its own bus; run it through the delay and the pan and
+	// put the result on Multi Outputs 1 and 2.
+	if (fx_on)
+		fx_render(stream);
 }
 
 int16_t mb87419_mb87420_device::decode_sample(int8_t data)

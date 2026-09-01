@@ -143,6 +143,18 @@ private:
 	static constexpr unsigned NUM_SLOTS = 34;
 	static constexpr unsigned SLOT_CHORUS = 32;   // register-file slot 0x20
 	static constexpr unsigned SLOT_TREMOLO = 33;  // register-file slot 0x21
+	// IC17, a CXK5814: 2K x 8, on IC15's wave address bus, written and read only by IC15
+	// and never visible to the CPU.  At the 32 kHz engine rate that is 64 ms; the chorus
+	// tables reach 32 ms of it.
+	static constexpr unsigned FX_DELAY_LEN = 2048;
+	// The chorus tap is the LFO slot's linear level shifted right by this much.  Measured
+	// at 13.90-13.96 from the pitch sidebands at five depth and rate settings, and
+	// corroborated by the ROM's own targets landing on 32, 512 and 1024 samples.
+	static constexpr unsigned FX_TAP_SHIFT = 14;
+	// The delayed copy's weight against the dry.  Three independent readings of the same
+	// capture -- total level +1.1 dB, sideband energy -5.6 dB against the carrier, and a
+	// comb 8.3 dB deep -- put it at 0.45 to 0.55.
+	static constexpr double FX_CHORUS_MIX = 0.5;
 	static constexpr unsigned HIST_LEN = 16;
 
 	struct pcm_channel
@@ -228,7 +240,9 @@ private:
 	void env_segment(pcm_channel &chn);
 	void env_scan();
 	void env_arrived(unsigned voice);
-	void env_advance_slot(pcm_channel &chn, unsigned slot, int samples);
+	void env_advance_slot(pcm_channel &chn, unsigned slot, int samples,
+			std::vector<double> *trace);
+	void fx_render(sound_stream &stream);
 
 	devcb_write_line m_int_callback;
 
@@ -272,6 +286,21 @@ private:
 	u8 m_fx_config = 0;
 	u8 m_fx_reg19 = 0;
 	u8 m_fx_reg1b = 0;
+
+	// The effect stage.  It sits on Voice Group 1 only -- the voices the driver has given
+	// mask 0x03, i.e. Multi Outputs 1 and 2 -- and both effects are driven from one LFO
+	// each, LEFT taking the slot's level and RIGHT its complement about the two segment
+	// endpoints.  Measured: the tremolo's two channels sum to a constant, and the chorus's
+	// two taps sweep in exactly opposite directions (correlation -1.000).  See
+	// analysis/EFFECTS.md section 8.
+	std::vector<sound_stream::sample_t> m_fx_bus;   // group 1's mono sum for this block
+	std::vector<double> m_fx_lfo[2];                // per-sample level of slots 0x20 / 0x21
+	std::vector<float> m_fx_line;                   // the delay line, FX_DELAY_LEN long
+	u32 m_fx_pos = 0;
+	// Sum of the two ramp endpoints, captured when a segment is programmed.  The complement
+	// the right channel needs is endpoint_sum - level, and the chip has both endpoints in
+	// front of it; this device only sees one at a time, so it remembers.
+	double m_fx_endsum[2] = { 0.0, 0.0 };
 	uint8_t m_status_voice = 0;         // voice selected for the 0x02/0x03 readback
 	uint8_t m_status_field = 0;         // 0 = low 16 bits, 1 = high 10 bits, 2 = log level
 };
