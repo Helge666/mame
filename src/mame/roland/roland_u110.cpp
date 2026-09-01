@@ -169,6 +169,7 @@
 #include "sound/flt_biquad.h"
 #include "sound/flt_rc.h"
 #include "speaker.h"
+#include "sound.h"        // audio_dither_enabled(), for the null test
 
 #include <array>
 #include <bit>
@@ -821,7 +822,10 @@ TIMER_CALLBACK_MEMBER(roland_u110_state::midi_rx_cb)
 	{
 		m_maincpu->serial_w(m_rx_data);     // stop bit reached; hand the byte over
 		if (m_trace_midi_rx)
-			logerror("MIDI IN %02X\n", m_rx_data);
+			// The TIME matters as much as the byte: the null test replays these into the
+			// plugin core at the same emulated instants, so that a difference in the
+			// rendered audio is the emulation and not the MIDI transport.
+			logerror("MIDI IN %f %02X\n", machine().time().as_double(), m_rx_data);
 		m_rx_bit = -1;
 	}
 }
@@ -1000,6 +1004,14 @@ INPUT_PORTS_END
 
 void roland_u110_state::machine_start()
 {
+	// U110_DITHER=0 turns off the TPDF dither at the 16-bit output.  The null test against
+	// the plugin core needs it off at BOTH ends: dither is deterministic here (a seeded
+	// xorshift32, which is why two MAME runs match), but the core cannot reproduce MAME's
+	// exact call sequence into it, and there is no reason it should have to.  See
+	// emu/sound.h and PLUGIN-PLAN.md section 4.
+	if (char const *const d = getenv("U110_DITHER"))
+		audio_dither_enabled() = (atoi(d) != 0);
+
 	m_lcd_timer = timer_alloc(FUNC(roland_u110_state::lcd_int_cb), this);
 	m_midi_rx_timer = timer_alloc(FUNC(roland_u110_state::midi_rx_cb), this);
 	m_midi_tx_timer = timer_alloc(FUNC(roland_u110_state::midi_tx_cb), this);
