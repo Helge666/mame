@@ -1042,7 +1042,11 @@ void roland_u110_state::machine_start()
 
 void roland_u110_state::update_eq()
 {
-	const bool on = !m_eq_enable || BIT(m_eq_enable->read(), 0);
+	// U110_EQ=0 forces the correction off without touching cfg, for A/B renders.  The
+	// front-panel switch under Machine Configuration still works when it is unset.
+	static char const *const env_eq = getenv("U110_EQ");
+	bool const on = env_eq ? (atoi(env_eq) != 0)
+						   : (!m_eq_enable || BIT(m_eq_enable->read(), 0));
 	for (int ch = 0; ch < 2; ch ++)
 		m_eq[ch]->modify(filter_biquad_device::biquad_type::PEAK,
 				EQ_FC, EQ_Q, on ? EQ_GAIN : 1.0);
