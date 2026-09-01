@@ -134,6 +134,15 @@ protected:
 
 private:
 	static constexpr unsigned NUM_CHANNELS = 32;
+	// ...plus two.  Slots 0x20 and 0x21 are ramp generators like any other, but they carry
+	// no sample and never sound: 0x20 is the CHORUS LFO and 0x21 the TREMOLO LFO.  The
+	// firmware starts them at patch load (0xB4C6), and the interrupt handler turns each one
+	// round at its target (0x4241 / 0x427A) by reading back the segment through select 0x16
+	// and testing the RATE's sign bit -- so the ramp generator's own machinery produces the
+	// LFO and nothing extra is needed to make it run.  See analysis/EFFECTS.md.
+	static constexpr unsigned NUM_SLOTS = 34;
+	static constexpr unsigned SLOT_CHORUS = 32;   // register-file slot 0x20
+	static constexpr unsigned SLOT_TREMOLO = 33;  // register-file slot 0x21
 	static constexpr unsigned HIST_LEN = 16;
 
 	struct pcm_channel
@@ -219,17 +228,18 @@ private:
 	void env_segment(pcm_channel &chn);
 	void env_scan();
 	void env_arrived(unsigned voice);
+	void env_advance_slot(pcm_channel &chn, unsigned slot, int samples);
 
 	devcb_write_line m_int_callback;
 
 	uint32_t m_clock;                   // clock
 	uint32_t m_rate;                    // sample rate (usually 32000 Hz)
 	sound_stream* m_stream;             // stream handle
-	pcm_channel m_chns[NUM_CHANNELS];   // channel memory
+	pcm_channel m_chns[NUM_SLOTS];      // channel memory; the last two are the LFO slots
 	uint8_t m_sel_chn;
 	pcm_mode m_pcm_mode = PCM_DIFFERENTIAL;
 	int m_out_count = 2;
-	u8 m_voice_mask[NUM_CHANNELS];
+	u8 m_voice_mask[NUM_SLOTS];
 	u32 m_rate_div = 1024;
 	double m_delta_dc_hz = 0.0;         // leak corner for PCM_FLOAT8_DELTA
 	double m_delta_keep = 1.0;          // per-sample retention derived from it
@@ -243,7 +253,7 @@ private:
 	// envelope ramp generator
 	bool m_env_engine = false;
 	u32 m_env_scan_hz = 8000;           // ceiling on interrupts/s
-	u32 m_env_pending = 0;              // one bit per voice whose ramp has arrived
+	u64 m_env_pending = 0;              // one bit per slot whose ramp has arrived (34 of them)
 	u32 m_env_slots = 0x22;             // 32 voices plus the two chorus/tremolo slots
 	emu_timer *m_env_timer = nullptr;   // ...which is its own timer, not the sound stream:
 	                                    // pulsing once per stream block would collapse a
@@ -253,6 +263,15 @@ private:
 	u32 m_env_offer_age = 0;            // ticks since it was made
 	static constexpr u32 ENV_OFFER_RETRY = 32;  // re-pulse after this many, ~2 ms
 	bool m_env_int = false;             // state of the INT line
+	// Register 0x1D, written at patch load from the output mode's own config byte
+	// (0xA726 + 8*mode): bit 1 enables TREMOLO, bit 3 enables CHORUS, bit 4 the effect
+	// section as a whole.  Only the odd L/R output modes 21-49 set them, which is why no
+	// factory patch has an effect on.  Registers 0x19 / 0x1B are written 0x00 / 0x21 here
+	// and at the 0x43DA init and never anything else; `[I]` they read as the slot scan
+	// range, which would match NUM_SLOTS, but there is no evidence for that.
+	u8 m_fx_config = 0;
+	u8 m_fx_reg19 = 0;
+	u8 m_fx_reg1b = 0;
 	uint8_t m_status_voice = 0;         // voice selected for the 0x02/0x03 readback
 	uint8_t m_status_field = 0;         // 0 = low 16 bits, 1 = high 10 bits, 2 = log level
 };

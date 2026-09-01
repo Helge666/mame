@@ -198,9 +198,9 @@ u8 mb87419_mb87420_device::read(offs_t offset)
 			// Reading it is the acknowledge for that voice.
 			if (ENV_TRACE)
 				logerror("ENVACK %f v%02X pending=%08X %s\n",
-						machine().time().as_double(), m_env_service, m_env_pending,
+						machine().time().as_double(), m_env_service, (u32)m_env_pending,
 						BIT(m_env_pending, m_env_service) ? "real" : "STALE");
-			m_env_pending &= ~(1u << m_env_service);
+			m_env_pending &= ~(1ull << m_env_service);
 			m_env_offered = false;
 			return m_env_service;
 		}
@@ -441,7 +441,7 @@ void mb87419_mb87420_device::write(offs_t offset, u8 data)
 							// A new note starts from silence and the attack walks up; the
 							// volume word the firmware wrote just before is the first
 							// segment.
-							m_env_pending &= ~(1u << (basechn + ch_id));
+							m_env_pending &= ~(1ull << (basechn + ch_id));
 							chn.env_level = 0.0;
 							env_segment(chn);
 						}
@@ -484,7 +484,7 @@ void mb87419_mb87420_device::write(offs_t offset, u8 data)
 		case 0x1A:
 			if (m_env_engine)
 			{
-				m_status_voice = data & 0x1F;
+				m_status_voice = std::min<uint8_t>(data & 0x3F, NUM_SLOTS - 1);
 				m_status_field = (offset == 0x10) ? 0 : (offset == 0x12) ? 1
 							   : (offset == 0x16) ? 2 : 3;
 			}
@@ -493,8 +493,23 @@ void mb87419_mb87420_device::write(offs_t offset, u8 data)
 				logerror("Writing unknown reg %02X = %02X\n", offset, data);
 			}
 			break;
+		// The effect configuration trio, written at patch load from 0xB4C6 and at the
+		// 0x43DA init.  0x1D carries the enables; see roland_lp.h.
+		case 0x19:  m_fx_reg19 = data;  break;
+		case 0x1B:  m_fx_reg1b = data;  break;
+		case 0x1D:
+			if (m_fx_config != data)
+				logerror("Effects config = %02X (chorus %s, tremolo %s)\n", data,
+						BIT(data, 3) ? "on" : "off", BIT(data, 1) ? "on" : "off");
+			m_fx_config = data;
+			break;
 		case 0x1F:
-			m_sel_chn = data & 0x1F;
+			// SIX bits, not five.  The firmware selects slots 0x20 and 0x21 here to program
+			// the chorus and tremolo LFOs; masking to 0x1F aliased them onto voices 0 and 1
+			// -- the wave-ROM read port and a real voice -- so every patch load with an
+			// effect mode selected would have written the LFO's mode, level and segment into
+			// voice 1.
+			m_sel_chn = std::min<uint8_t>(data & 0x3F, NUM_SLOTS - 1);
 			break;
 		default:
 			logerror("Writing unknown reg %02X = %02X\n", offset, data);
@@ -624,7 +639,7 @@ void mb87419_mb87420_device::env_scan()
 	if (m_env_offered && ++ m_env_offer_age < ENV_OFFER_RETRY)
 		return;
 
-	for (unsigned i = 0; i < NUM_CHANNELS; i ++)
+	for (unsigned i = 0; i < NUM_SLOTS; i ++)
 		if (BIT(m_env_pending, i))
 		{
 			m_env_service = i;
@@ -636,6 +651,25 @@ void mb87419_mb87420_device::env_scan()
 	m_int_callback(ASSERT_LINE);
 }
 
+// The two LFO slots never reach the audio loop -- nothing ever sets their enable bit and
+// they carry no sample -- but their ramps still have to run, because the alternation the
+// firmware performs when one arrives IS the chorus or tremolo waveform.
+void mb87419_mb87420_device::env_advance_slot(pcm_channel &chn, unsigned slot, int samples)
+{
+	while (samples -- > 0 && chn.env_rate != 0.0)
+	{
+		chn.env_level += chn.env_rate;
+		if ((chn.env_rate > 0.0 && chn.env_level >= chn.env_target)
+				|| (chn.env_rate < 0.0 && chn.env_level <= chn.env_target))
+		{
+			chn.env_level = chn.env_target;
+			chn.env_rate = 0.0;
+			env_arrived(slot);
+			break;
+		}
+	}
+}
+
 // A voice's ramp reached its target: it needs its next envelope segment.
 void mb87419_mb87420_device::env_arrived(unsigned voice)
 {
@@ -643,7 +677,7 @@ void mb87419_mb87420_device::env_arrived(unsigned voice)
 		logerror("ENVARR %f v%02X level=%.0f target=%.0f\n",
 				machine().time().as_double(), voice, m_chns[voice].env_level,
 				m_chns[voice].env_target);
-	m_env_pending |= 1u << voice;
+	m_env_pending |= 1ull << voice;
 }
 
 // The voice volume pair is NOT a linear 16-bit magnitude, and it is not two levels: it is
@@ -701,6 +735,10 @@ void mb87419_mb87420_device::set_mix_gain_db(double db)
 
 void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 {
+	if (m_env_engine)
+		for (unsigned slot = NUM_CHANNELS; slot < NUM_SLOTS; slot ++)
+			env_advance_slot(m_chns[slot], slot, stream.samples());
+
 	for (auto& chn : m_chns)
 	{
 		// With the ramp generator the fade after note-off is the envelope's, driven by the
