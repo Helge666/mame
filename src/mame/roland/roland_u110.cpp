@@ -159,6 +159,8 @@
 #include "sound/roland_lp.h"
 #include "video/msm6222b.h"
 
+#include "roland_u110_data.h"
+
 #include "emupal.h"
 #include "screen.h"
 #include "softlist_dev.h"
@@ -172,39 +174,12 @@
 
 namespace {
 
-// unscramble address: ROM dump offset -> proper (descrambled) offset
-template <typename T> constexpr auto UNSCRAMBLE_ADDR(T &&offset)
-{ return bitswap<19>(offset,18,17,15,14,16,12,11, 7, 9,13,10, 8, 3, 2, 1, 6, 4, 5, 0); }
+// The wave-ROM permutations, the fifty output modes, the measured pan positions, the
+// reconstruction filter's component values and the fitted output EQ all live in
+// roland_u110_data.h, because the Voltaire 110 plugin core needs exactly the same numbers
+// and two copies would drift.  See PLUGIN-PLAN.md section 3.
+using namespace roland_u110;
 
-constexpr u8 UNSCRAMBLE_DATA(u8 data)
-{ return bitswap<8>(data,1,2,7,3,5,0,4,6); }
-
-// The sound chip fetches two bytes ahead of the address the CPU parks in the phase
-// accumulator.  The U-110 firmware compensates for this itself at 0x7BB2
-// ("SUB RW56,RW50,#0x2"), so the emulated read port has to put it back.  The CM-32P driver
-// does the same thing.  If cards refuse to mount but internal banks read fine, try 0.
-constexpr int PCM_READ_PREFETCH = 2;
-
-// Output gain.  The U-110's own scaling is quiet -- a single max-velocity note on a
-// sustained tone with part level 127 peaks around -16 dBFS even after the sound device's
-// 12 dB calibration fix (see VOICE_FS in roland_lp.h), because the firmware asks the chip
-// for a sustain level of 0xDB, 13.5 dB below its full scale, to leave room for 31 voices.
-// Real behaviour, but on a modern output it is quiet, so the gain is exposed rather than
-// baked in.
-//
-// Measured worst cases at 0 dB (E. Organ 1, velocity 127, CC7 127, sustained cluster):
-//
-//     1 note   -15.8 dBFS      8 notes   -4.5 dBFS
-//     2 notes  -10.9 dBFS     12 notes   -1.6 dBFS
-//     4 notes   -7.1 dBFS     16 notes   -0.9 dBFS
-//
-// so 0 dB is as loud as this can be without a dense cluster clipping the 16-bit output.
-// Ordinary playing has headroom to spare; +6 dB is comfortable up to about eight notes.
-constexpr int GAIN_STEPS   = 16;
-constexpr int GAIN_MIN_DB  = -9;
-constexpr int GAIN_STEP_DB = 3;
-constexpr int GAIN_DEFAULT = 3;                 // index of 0 dB
-constexpr int gain_db_for(int idx) { return GAIN_MIN_DB + GAIN_STEP_DB * idx; }
 
 
 class roland_u110_state : public driver_device
@@ -279,12 +254,8 @@ private:
 	template <unsigned Slot> DECLARE_DEVICE_IMAGE_LOAD_MEMBER(card_load);
 	template <unsigned Slot> DECLARE_DEVICE_IMAGE_UNLOAD_MEMBER(card_unload);
 
-	static void descramble_pcm(u8 *dst, const u8 *src, size_t len);
 
 	// Measured output EQ correction (see u110(), "Output EQ correction").
-	static constexpr double EQ_FC   = 5933.3;    // Hz
-	static constexpr double EQ_Q    = 1.9306;
-	static constexpr double EQ_GAIN = 0.436787;  // -7.195 dB, multiplicative
 	void update_eq();
 
 	void update_gain(bool announce);
@@ -683,85 +654,14 @@ u8 roland_u110_state::pcm_data_r()
 
 
 /**************************************************************************************
-    Output Modes — Owner's Manual p.27
+    Output Modes - Owner's Manual p.27
 
     A mode partitions the 31 voices into Voice Groups; a Part's Output Assign (patch part
-    byte +0x0B >> 5) picks a group, and group N drives Multi Output N.  The firmware keeps
-    the current mode index (mode - 1) at RAM 0x280E and uses it to block-copy eight routing
-    bytes from its own table into 0x1F00-0x1F07 (routine at 0xB721).
+    byte +0x0B >> 5) picks a group, and group N drives Multi Output N.
 
-    Modes 21-50 put Multi Outputs 1 and 2 on one group with the effect switchable: 'M' is
-    dry and centred, 'L/R' is the wet stereo pair.  The manual's own footnote.  Voices are
-    numbered 1-31 — voice 0 is the CPU's wave-ROM read port and never sounds.
-
-    Transcribed from the scan and checked against the invariant that every row partitions
-    exactly 31 voices; mode 10 was recovered from that constraint alone where the scan had
-    lost its "8 8".  Mode 20 reproduces the six measured Wide Piano groups exactly.
+    The table and the partitioning rule are in roland_u110_data.h, along with how they
+    were recovered.  Only the part that touches the emulated machine is here.
 **************************************************************************************/
-
-namespace {
-
-struct output_mode
-{
-	u8 kind;        // 0 = plain, 1 = L/R pair on outputs 1+2, 2 = centred on outputs 1+2
-	u8 sizes[6];
-};
-
-const output_mode OUTPUT_MODES[50] =
-{
-	{ 0, { 31,  0,  0,  0,  0,  0 } },   //  1
-	{ 0, { 27,  4,  0,  0,  0,  0 } },   //  2
-	{ 0, { 23,  8,  0,  0,  0,  0 } },   //  3
-	{ 0, { 23,  4,  4,  0,  0,  0 } },   //  4
-	{ 0, { 19, 12,  0,  0,  0,  0 } },   //  5
-	{ 0, { 19,  8,  4,  0,  0,  0 } },   //  6
-	{ 0, { 19,  4,  4,  4,  0,  0 } },   //  7
-	{ 0, { 15, 16,  0,  0,  0,  0 } },   //  8
-	{ 0, { 15, 12,  4,  0,  0,  0 } },   //  9
-	{ 0, { 15,  8,  8,  0,  0,  0 } },   // 10
-	{ 0, { 15,  8,  4,  4,  0,  0 } },   // 11
-	{ 0, { 15,  4,  4,  4,  4,  0 } },   // 12
-	{ 0, { 11, 12,  8,  0,  0,  0 } },   // 13
-	{ 0, { 11, 12,  4,  4,  0,  0 } },   // 14
-	{ 0, { 11,  8,  8,  4,  0,  0 } },   // 15
-	{ 0, { 11,  8,  4,  4,  4,  0 } },   // 16
-	{ 0, { 11,  4,  4,  4,  4,  4 } },   // 17
-	{ 0, {  7,  8,  8,  8,  0,  0 } },   // 18
-	{ 0, {  7,  8,  8,  4,  4,  0 } },   // 19
-	{ 0, {  7,  8,  4,  4,  4,  4 } },   // 20
-	{ 1, { 31,  0,  0,  0,  0,  0 } },   // 21  L/R pair
-	{ 2, { 31,  0,  0,  0,  0,  0 } },   // 22  centred
-	{ 1, { 16, 15,  0,  0,  0,  0 } },   // 23  L/R pair
-	{ 2, { 16, 15,  0,  0,  0,  0 } },   // 24  centred
-	{ 1, { 16, 11,  4,  0,  0,  0 } },   // 25  L/R pair
-	{ 2, { 16, 11,  4,  0,  0,  0 } },   // 26  centred
-	{ 1, { 16,  7,  8,  0,  0,  0 } },   // 27  L/R pair
-	{ 2, { 16,  7,  8,  0,  0,  0 } },   // 28  centred
-	{ 1, { 16,  7,  4,  4,  0,  0 } },   // 29  L/R pair
-	{ 2, { 16,  7,  4,  4,  0,  0 } },   // 30  centred
-	{ 1, { 16,  3,  4,  4,  4,  0 } },   // 31  L/R pair
-	{ 2, { 16,  3,  4,  4,  4,  0 } },   // 32  centred
-	{ 1, {  8, 23,  0,  0,  0,  0 } },   // 33  L/R pair
-	{ 2, {  8, 23,  0,  0,  0,  0 } },   // 34  centred
-	{ 1, {  8, 19,  4,  0,  0,  0 } },   // 35  L/R pair
-	{ 2, {  8, 19,  4,  0,  0,  0 } },   // 36  centred
-	{ 1, {  8, 15,  8,  0,  0,  0 } },   // 37  L/R pair
-	{ 2, {  8, 15,  8,  0,  0,  0 } },   // 38  centred
-	{ 1, {  8, 15,  4,  4,  0,  0 } },   // 39  L/R pair
-	{ 2, {  8, 15,  4,  4,  0,  0 } },   // 40  centred
-	{ 1, {  8, 11, 12,  0,  0,  0 } },   // 41  L/R pair
-	{ 2, {  8, 11, 12,  0,  0,  0 } },   // 42  centred
-	{ 1, {  8, 11,  8,  4,  0,  0 } },   // 43  L/R pair
-	{ 2, {  8, 11,  8,  4,  0,  0 } },   // 44  centred
-	{ 1, {  8, 11,  4,  4,  4,  0 } },   // 45  L/R pair
-	{ 2, {  8, 11,  4,  4,  4,  0 } },   // 46  centred
-	{ 1, {  8,  7,  8,  8,  0,  0 } },   // 47  L/R pair
-	{ 2, {  8,  7,  8,  8,  0,  0 } },   // 48  centred
-	{ 1, {  8,  7,  8,  4,  4,  0 } },   // 49  L/R pair
-	{ 2, {  8,  7,  8,  4,  4,  0 } },   // 50  centred
-};
-
-} // anonymous namespace
 
 /**************************************************************************************
     Output routing - IC26/IC6 BU3905S at 0x1F00-0x1F08
@@ -787,27 +687,20 @@ void roland_u110_state::out_ctrl_w(offs_t offset, u16 data, u16 mem_mask)
 // be, since the table sits at a different address in v2.00 and v2.03.
 void roland_u110_state::update_voice_routing()
 {
-	u8 const idx = m_maincpu->space(AS_PROGRAM).read_byte(0x280E);
-	if (idx >= 50)
-		return;
-	output_mode const &m = OUTPUT_MODES[idx];
+	u8 const idx = m_maincpu->space(AS_PROGRAM).read_byte(RAM_OUTPUT_MODE_INDEX);
 
-	u8 mask[32] = { 0 };
-	u8 voice = 1;                            // voice 0 is the CPU's wave-ROM read port
-	for (int g = 0; g < 6 && m.sizes[g] != 0; g ++)
-	{
-		// In modes 21-50 the first group occupies Multi Outputs 1 and 2 together -- dry and
-		// centred (M), or the wet stereo pair (L/R).  Later groups then start at output 3.
-		u8 const gm = (g == 0 && m.kind != 0) ? 0x03 : u8(1 << (m.kind != 0 ? g + 1 : g));
-		for (int i = 0; i < m.sizes[g] && voice < 32; i ++)
-			mask[voice ++] = gm;
-	}
-	for (int v = 0; v < 32; v ++)
+	u8 mask[NUM_VOICE_SLOTS];
+	voice_masks_for_mode(idx, mask);
+	for (int v = 0; v < NUM_VOICE_SLOTS; v ++)
 		m_pcm->set_voice_mask(v, mask[v]);
-	if (m_trace_tg)
+
+	if (m_trace_tg && idx < NUM_OUTPUT_MODES)
+	{
+		output_mode const &m = OUTPUT_MODES[idx];
 		logerror("ROUTING idx=%u kind=%u sizes=%u,%u,%u,%u,%u,%u masks v1=%02X v8=%02X v16=%02X v28=%02X\n",
 			idx, m.kind, m.sizes[0], m.sizes[1], m.sizes[2], m.sizes[3], m.sizes[4], m.sizes[5],
 			mask[1], mask[8], mask[16], mask[28]);
+	}
 }
 
 /**************************************************************************************
@@ -829,7 +722,7 @@ void roland_u110_state::midi_rxd_w(int state)
 	{
 		m_rx_bit = 0;
 		m_rx_data = 0;
-		m_midi_rx_timer->adjust(attotime::from_ticks(3, 2 * 31250));
+		m_midi_rx_timer->adjust(attotime::from_ticks(3, 2 * MIDI_BAUD));
 	}
 	m_rxd = state;
 }
@@ -840,7 +733,7 @@ TIMER_CALLBACK_MEMBER(roland_u110_state::midi_rx_cb)
 	{
 		m_rx_data |= m_rxd << m_rx_bit;
 		m_rx_bit++;
-		m_midi_rx_timer->adjust(attotime::from_ticks(1, 31250));
+		m_midi_rx_timer->adjust(attotime::from_ticks(1, MIDI_BAUD));
 	}
 	else
 	{
@@ -855,12 +748,6 @@ TIMER_CALLBACK_MEMBER(roland_u110_state::midi_rx_cb)
 /**************************************************************************************
     PCM cards
 **************************************************************************************/
-
-void roland_u110_state::descramble_pcm(u8 *dst, const u8 *src, size_t len)
-{
-	for (offs_t srcpos = 0; srcpos < len; srcpos++)
-		dst[UNSCRAMBLE_ADDR(srcpos)] = UNSCRAMBLE_DATA(src[srcpos]);
-}
 
 template <unsigned Slot>
 DEVICE_IMAGE_LOAD_MEMBER(roland_u110_state::card_load)
@@ -885,7 +772,7 @@ DEVICE_IMAGE_LOAD_MEMBER(roland_u110_state::card_load)
 	}
 
 	// card N lives at N*0x100000 + 0x080000 in the descrambled PCM space
-	descramble_pcm(&m_pcmrom[Slot * 0x100000 + 0x80000], base, 0x80000);
+	descramble_pcm(&m_pcmrom[Slot * CARD_STRIDE + CARD_OFFSET], base, CARD_SIZE);
 	m_card_present &= ~(1 << Slot);
 
 	return std::make_pair(std::error_condition(), std::string());
@@ -1109,7 +996,7 @@ void roland_u110_state::init_u110()
 	// Cards are descrambled on load into the gaps between them.
 	u8 const *const src = memregion("pcmorg")->base();
 	for (int bank = 0; bank < 4; bank++)
-		descramble_pcm(&m_pcmrom[bank * 0x100000], &src[bank * 0x80000], 0x80000);
+		descramble_pcm(&m_pcmrom[bank * CARD_STRIDE], &src[bank * CARD_SIZE], CARD_SIZE);
 }
 
 void roland_u110_state::u110(machine_config &config)
@@ -1194,41 +1081,17 @@ void roland_u110_state::u110(machine_config &config)
 	// voice_status() should go once this has had some mileage.
 	m_pcm->set_env_release_db_per_s(127.0);
 	m_pcm->set_env_decay_db_per_s(0.0);
-	// Six Multi Outputs, summed to the MIX pair.
-	//
-	// Pan positions measured on real hardware with service test 11, which steps the jacks in
-	// order ("Jack 1 2 3 4 5 6 VOICE- CHORUS TREMORO", firmware string at 0x08F18).  R-L came
-	// out +65.9, -65.9, 0.0, 0.0, +6.7, -6.8 dB, with L/R correlation 1.000 and zero delay --
-	// the multiplex routes, it does not time-shift.
-	//
-	// `[I]` The capture reads jack 1 as hard RIGHT, but Roland labels OUTPUT 1 as MIX L, so
-	// the recording is almost certainly channel-swapped at the interface; the table below is
-	// mirrored to the labelling.  Wide Piano then sweeps low-to-high left-to-right, which is
-	// what confirms the jack-to-position assignment either way.
-	static constexpr double PAN_L[6] = { 1.000000, 0.000507, 0.707107, 0.707107, 0.907800, 0.415900 };
-	static constexpr double PAN_R[6] = { 0.000507, 1.000000, 0.707107, 0.707107, 0.419800, 0.909900 };
+	// Six Multi Outputs, summed to the MIX pair.  PAN_L/PAN_R and the filter component
+	// values below are in roland_u110_data.h, measured and documented there.
 
-	// Anti-aliasing / reconstruction filter, service notes Fig. 4: two unity-gain Sallen-Key
-	// lowpass sections built round IC30-35 (uPC4570) plus an output RC.  Component values are
-	// the schematic's, so MAME derives fc and Q itself:
-	//   R39/R40 10k, C53 8200p, C52 680p  ->  6740 Hz, Q 1.74
-	//   R41/R42 10k, C55 3300p, C54 560p  -> 11708 Hz, Q 1.21
-	//   R78 10k, C56 2200p                ->  7234 Hz, one pole
-	// Fifth order overall; the service notes' own simulation gives max +2.17 dB, min -48.57 dB.
-	//
-	// The hardware has six of these chains, one per Multi Output.  They are identical and the
-	// filter is linear, so summing first and filtering the two mix buses is equivalent to
-	// filtering all six and then summing -- two chains instead of eighteen.
-	static constexpr double SK_R3 = RES_M(999.99);  // absent
-	static constexpr double SK_R4 = RES_R(0.001);   // short: unity gain
 
 	for (int ch = 0; ch < 2; ch ++)
 	{
 		FILTER_BIQUAD(config, m_lpf_sk[ch * 2 + 0]).opamp_sk_lowpass_setup(
-				RES_K(10), RES_K(10), SK_R3, SK_R4, CAP_P(8200), CAP_P(680));
+				SK1_R1, SK1_R2, SK_R3, SK_R4, SK1_C1, SK1_C2);
 		FILTER_BIQUAD(config, m_lpf_sk[ch * 2 + 1]).opamp_sk_lowpass_setup(
-				RES_K(10), RES_K(10), SK_R3, SK_R4, CAP_P(3300), CAP_P(560));
-		FILTER_RC(config, m_lpf_rc[ch]).set_lowpass(RES_K(10), CAP_P(2200));
+				SK2_R1, SK2_R2, SK_R3, SK_R4, SK2_C1, SK2_C2);
+		FILTER_RC(config, m_lpf_rc[ch]).set_lowpass(RC_R, RC_C);
 
 		for (int out = 0; out < 6; out ++)
 			m_pcm->add_route(out, m_lpf_sk[ch * 2 + 0], ch ? PAN_R[out] : PAN_L[out]);
