@@ -23,6 +23,15 @@
 #include "emu.h"
 #include "roland_lp.h"
 
+// Register-level tracing of the envelope handshake, for the decay investigation.  Off
+// unless U110_ENVTRACE is set in the environment, so it costs one predictable branch.
+static bool env_trace_enabled()
+{
+	static bool const on = getenv("U110_ENVTRACE") != nullptr;
+	return on;
+}
+#define ENV_TRACE env_trace_enabled()
+
 #include <cmath>
 
 
@@ -84,6 +93,8 @@ void mb87419_mb87420_device::device_reset()
 	m_env_int = false;
 	m_env_service = 0;
 	m_env_pending = 0;
+	m_env_offered = false;
+	m_env_offer_age = 0;
 	m_status_voice = 0;
 	m_status_field = 0;
 	for (auto &chn : m_chns)
@@ -112,7 +123,12 @@ u8 mb87419_mb87420_device::read(offs_t offset)
 		if (offset == 0x00)
 		{
 			// Reading it is the acknowledge for that voice.
+			if (ENV_TRACE)
+				logerror("ENVACK %f v%02X pending=%08X %s\n",
+						machine().time().as_double(), m_env_service, m_env_pending,
+						BIT(m_env_pending, m_env_service) ? "real" : "STALE");
 			m_env_pending &= ~(1u << m_env_service);
+			m_env_offered = false;
 			return m_env_service;
 		}
 		// 02/03 - the selected voice's current level, in whichever field the last select
@@ -506,20 +522,52 @@ void mb87419_mb87420_device::env_scan()
 	// interrupt, it is lost, and with the line already high no further edge is ever
 	// produced -- and dropping and raising it in the same instant does not reliably reach
 	// the CPU as a single edge either.
-	m_env_int = ! m_env_int;
+	//
+	// ONE rising edge per offer, and no further edge until the CPU has taken this one.
+	// Toggling on every tick regardless -- which is what this did -- puts an edge on the
+	// line every other tick for as long as ANY voice is waiting.  The firmware's handler
+	// runs about 300 us and the tick is 62.5 us, so several of those edges land while the
+	// CPU is still inside the handler; the 8x9x latches one of them, and it is answered
+	// AFTER the read of register 00 that acknowledged the real offer.  Register 00 then
+	// names the voice it named last time, and the handler -- which does not verify that
+	// the voice has arrived -- advances that voice's phase machine a second time.
+	//
+	// On A. Piano 1 that lands on the second voice of the V-MIX every time (see
+	// analysis/ENVELOPE-DECAY.md): it is given its phase-3 segment 0.3 ms after its
+	// phase-2 segment, while its level is still at the attack peak, so the rung is far
+	// longer than it should be, never arrives, and the ladder stops there.
 	if (m_env_int)
-		for (unsigned i = 0; i < NUM_CHANNELS; i ++)
-			if (BIT(m_env_pending, i))
-			{
-				m_env_service = i;
-				break;
-			}
-	m_int_callback(m_env_int ? ASSERT_LINE : CLEAR_LINE);
+	{
+		m_env_int = false;
+		m_int_callback(CLEAR_LINE);
+		return;
+	}
+	// An offer already on the table stays there.  The re-pulse below is only a safety
+	// valve for an edge lost because the firmware had EXTINT masked; while the offer is
+	// outstanding its pending bit is still set, so re-offering it names the same voice
+	// and costs nothing.
+	if (m_env_offered && ++ m_env_offer_age < ENV_OFFER_RETRY)
+		return;
+
+	for (unsigned i = 0; i < NUM_CHANNELS; i ++)
+		if (BIT(m_env_pending, i))
+		{
+			m_env_service = i;
+			break;
+		}
+	m_env_offered = true;
+	m_env_offer_age = 0;
+	m_env_int = true;
+	m_int_callback(ASSERT_LINE);
 }
 
 // A voice's ramp reached its target: it needs its next envelope segment.
 void mb87419_mb87420_device::env_arrived(unsigned voice)
 {
+	if (ENV_TRACE)
+		logerror("ENVARR %f v%02X level=%.0f target=%.0f\n",
+				machine().time().as_double(), voice, m_chns[voice].env_level,
+				m_chns[voice].env_target);
 	m_env_pending |= 1u << voice;
 }
 

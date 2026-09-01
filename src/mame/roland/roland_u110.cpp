@@ -593,7 +593,17 @@ u16 roland_u110_state::snd_r(offs_t offset, u16 mem_mask)
 		if (offset == 0x01)
 			result |= pcm_data_r();
 		else if (offset == 0x00 && ENV_ENGINE)
-			return m_pcm->read(0x00);   // NOT offset+1: register 01 is the ROM read port
+		{
+			u8 const v = m_pcm->read(0x00);
+			// Pairs with the ENVACK/ENVARR trace in roland_lp.cpp -- same U110_ENVTRACE
+			// switch, but from this side the CPU's PC comes with it, which is how the
+			// spurious third interrupt was pinned to the handler entry at 0x41D5.
+			static bool const env_trace = getenv("U110_ENVTRACE") != nullptr;
+			if (env_trace)
+				logerror("ENVRD %f -> v%02X  @%s\n", machine().time().as_double(), v,
+						machine().describe_context());
+			return v;   // NOT offset+1: register 01 is the ROM read port
+		}
 		else if (offset == 0x02)
 			return ENV_ENGINE ? (u16(m_pcm->read(0x02)) | (u16(m_pcm->read(0x03)) << 8))
 							  : voice_status();

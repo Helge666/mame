@@ -59,12 +59,6 @@ public:
 	// interrupt at a time.  If this model is right, the decay falls out on its own.
 	void set_env_engine(bool on) { m_env_engine = on; }
 
-	// The interrupt is a free-running ROUND-ROBIN scanner, not a signal that a ramp
-	// finished: the handler reads register 00 to learn WHICH slot it is being offered,
-	// checks that slot's own state and usually does nothing.  Reading it as "interrupt on
-	// arrival" instead produces an interrupt storm -- the CPU answers each one with a fresh
-	// segment, that segment arrives at once, and it interrupts again.
-	//
 	// The chip raises INT when a voice's ramp ARRIVES at its target, naming that voice in
 	// register 00; the handler's phase machine then advances one step and programs the next
 	// segment.  The advance at 0xBAD4 is an unconditional `incb`, so one interrupt IS one
@@ -75,6 +69,16 @@ public:
 	// This is paced rather than instantaneous: the line is offered on a timer, so several
 	// voices arriving together queue instead of racing, and the rate below is a CEILING on
 	// how often the CPU can be interrupted, not a fixed cadence.  Idle voices cost nothing.
+	//
+	// ONE EDGE PER OFFER, and none until the CPU has taken it.  The firmware reads register
+	// 00 exactly once per interrupt (`ldbze 54, 1400` at 0x41D0) and does NOT check that
+	// the voice named there has arrived -- it trusts the offer and steps that voice's phase
+	// machine.  So an interrupt the chip did not mean to give is an envelope segment the
+	// voice did not ask for.  Toggling the line every tick while anything was pending made
+	// exactly that: the handler runs ~300 us against a 62.5 us tick, so several rising
+	// edges landed inside it, the 8x9x latched one, and it was answered AFTER the read that
+	// acknowledged the real offer -- with register 00 still naming the same voice.  See
+	// env_scan(), and analysis/ENVELOPE-DECAY.md for what it did to A. Piano 1.
 	//
 	// Registers 0x19 / 0x1B / 0x1D are NOT scanner configuration, though the 0x00/0x21/0x64
 	// the firmware writes to them at 0x43DA looks like it: the same trio is rewritten at
@@ -237,6 +241,9 @@ private:
 	                                    // pulsing once per stream block would collapse a
 	                                    // whole block's worth of offers into one edge
 	uint8_t m_env_service = 0;          // the slot register 0x00 is currently reporting
+	bool m_env_offered = false;         // an offer is on the line, unacknowledged
+	u32 m_env_offer_age = 0;            // ticks since it was made
+	static constexpr u32 ENV_OFFER_RETRY = 32;  // re-pulse after this many, ~2 ms
 	bool m_env_int = false;             // state of the INT line
 	uint8_t m_status_voice = 0;         // voice selected for the 0x02/0x03 readback
 	uint8_t m_status_field = 0;         // 0 = low 16 bits, 1 = high 10 bits, 2 = log level
