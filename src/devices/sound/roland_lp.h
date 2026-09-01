@@ -134,6 +134,7 @@ protected:
 
 private:
 	static constexpr unsigned NUM_CHANNELS = 32;
+	static constexpr unsigned HIST_LEN = 16;
 
 	struct pcm_channel
 	{
@@ -154,6 +155,11 @@ private:
 		uint32_t addr = 0;      // current address
 		int16_t smpl_cur = 0;   // current sample
 		int16_t smpl_prv = 0;   // the one before it, for the wider reconstruction kernel
+		// Sample history for the band-limited reconstruction: hist[hist_pos] is the
+		// newest, i.e. smpl_cur, and the ring runs backwards from there.
+		int16_t hist[HIST_LEN] = { };
+		uint8_t hist_pos = 0;
+		void push_hist(int16_t v) { hist_pos = (hist_pos + 1) % HIST_LEN; hist[hist_pos] = v; }
 		int16_t smpl_nxt = 0;   // next sample
 		double  acc = 0.0;      // PCM_FLOAT8_DELTA: the running sum of the deltas
 		double  acc_prev = 0.0; // ...and its value one fetch earlier

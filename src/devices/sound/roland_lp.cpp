@@ -45,6 +45,44 @@ static bool env_trace_enabled()
 // the only thing suppressing those copies.  Linear rejects an image of 1 kHz content by
 // 37 dB; one more order rejects it by 55 dB, while barely changing an image of 4 kHz
 // content.  That asymmetry is the shape of the measured error.
+// A band-limited reconstruction, for U110_RECON=2.  Linear interpolation is wrong in two
+// ways at once and they pull opposite ways: sinc^2 droops the PASSBAND by up to 7 dB
+// approaching the source Nyquist, and it leaks the IMAGES beyond it.  A tone whose energy
+// sits below its own Nyquist therefore comes out too dark (VIB 1, marimba, fingered bass)
+// while one whose content images into the band comes out too bright (BELL 1, A. PIANO 1 at
+// note 43) -- which is why a smoother kernel helped the second family and hurt the first.
+//
+// This is the other direction: flat to fs/2, steep past it.  A 16-tap Hann-windowed sinc,
+// 256 fractional phases, evaluated with a constant delay of 7 source samples so every tap
+// comes from history.  Only for step <= 1 (playing at or below the sample's own rate); a
+// step above 1 is decimation and wants a narrower cutoff, so it keeps the linear path.
+static constexpr int SINC_TAPS = 16;
+static constexpr int SINC_PHASES = 256;
+static double const *sinc_table()
+{
+	static std::vector<double> tbl = [] {
+		std::vector<double> t(SINC_PHASES * SINC_TAPS);
+		for (int ph = 0; ph < SINC_PHASES; ph ++)
+		{
+			double const frac = double(ph) / SINC_PHASES;
+			double sum = 0.0;
+			for (int j = 0; j < SINC_TAPS; j ++)
+			{
+				double const d = frac - (SINC_TAPS / 2) + j;   // spans [frac-8, frac+7]
+				double const x = M_PI * d;
+				double const si = (fabs(d) < 1e-9) ? 1.0 : sin(x) / x;
+				double const w = 0.5 * (1.0 + cos(M_PI * d / (SINC_TAPS / 2)));
+				t[ph * SINC_TAPS + j] = si * w;
+				sum += si * w;
+			}
+			for (int j = 0; j < SINC_TAPS; j ++)    // unity DC gain
+				t[ph * SINC_TAPS + j] /= sum;
+		}
+		return t;
+	}();
+	return tbl.data();
+}
+
 static int recon_mode()
 {
 	static int const mode = getenv("U110_RECON") ? atoi(getenv("U110_RECON")) : 0;
@@ -58,6 +96,8 @@ static int interp_mode()
 }
 
 #include <cmath>
+#include <vector>
+#include <algorithm>
 
 
 DEFINE_DEVICE_TYPE(MB87419_MB87420, mb87419_mb87420_device, "mb87419_mb87420", "Roland LP MB87419/MB87420 PCM")
@@ -403,6 +443,8 @@ void mb87419_mb87420_device::write(offs_t offset, u8 data)
 						chn.addr = chn.start;
 						offs_t addr = (chn.addr >> 14) | ((chn.bank & 0x3C00) << 8);
 						chn.smpl_cur = chn.smpl_prv = 0;
+						std::fill(std::begin(chn.hist), std::end(chn.hist), int16_t(0));
+						chn.hist_pos = 0;
 						chn.smpl_nxt = (m_pcm_mode == PCM_LINEAR8)
 								? (int16_t)(int8_t)read_byte(addr) * 16
 								: (m_pcm_mode == PCM_FLOAT8_DELTA)
@@ -664,7 +706,20 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 		for (int smpl = 0; smpl < stream.samples(); smpl ++)
 		{
 			s32 smp_raw;
-			if (recon_mode() == 1)
+			if (recon_mode() == 2 && chn.play_dir > 0 && chn.step <= 0x4000)
+			{
+				double const *const k = sinc_table()
+						+ (((chn.addr & 0x3FFF) * SINC_PHASES) >> 14) * SINC_TAPS;
+				double v = 0.0;
+				for (int j = 0; j < SINC_TAPS; j ++)
+				{
+					int16_t const smp = (j == 0) ? chn.smpl_nxt
+							: chn.hist[(chn.hist_pos + HIST_LEN - (j - 1)) % HIST_LEN];
+					v += k[j] * double(smp);
+				}
+				smp_raw = (s32)(v * 16384.0);
+			}
+			else if (recon_mode() == 1)
 			{
 				// Quadratic B-spline.  Weights sum to 1; the kernel is one order wider
 				// than the triangle a linear interpolation convolves with, which costs a
@@ -909,6 +964,7 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 					chn.smpl_prv = chn.smpl_cur;
 					chn.smpl_cur = (int16_t)std::clamp(
 							chn.pp_sign * chn.acc_prev + chn.pp_off, -8191.0, +8191.0);
+					chn.push_hist(chn.smpl_cur);
 					chn.smpl_nxt = (int16_t)std::clamp(
 							chn.pp_sign * chn.acc + chn.pp_off, -8191.0, +8191.0);
 				}
@@ -923,6 +979,7 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 				//logerror("Chn %u: sample addr 0x%05X.%03X\n", &chn - &m_chns[0], chn.addr >> 14, (chn.addr & 0x3FFF) << 2);
 				chn.smpl_prv = chn.smpl_cur;
 				chn.smpl_cur = chn.smpl_nxt;
+				chn.push_hist(chn.smpl_cur);
 				if (m_pcm_mode == PCM_FLOAT8)
 				{
 					// Sarayan's 1-3-4 rule is the correct decoder, but it is memoryless:
