@@ -39,7 +39,15 @@ static bool env_trace_enabled()
 //   2  carry the 14 fractional bits into the envelope multiply and quantise once, later
 // Reconstruction kernel, for the image-rejection investigation.  U110_RECON=
 //   0  linear interpolation between the two neighbouring samples (sinc^2)
-//   1  quadratic B-spline over three (sinc^3)
+//   1  quadratic B-spline over three (sinc^3)  -- THE DEFAULT
+//   2  16-tap Hann-windowed sinc, 256 phases
+//   3  Catmull-Rom
+//
+// 1 is the default because it measured best on both datasets: A. PIANO 1 note 43 goes from
+// 6.2 to 1.5 dB mean error against hardware over 2-10 kHz, and the six scratch tones from
+// 7.3 to 3.9.  2 and 3 are kept because they are what established that 1 is the right
+// shape -- 2 overshoots the stopband, 3 undershoots it, and 1 sits between them where the
+// hardware is.  All three apply only at step <= 1; see the gate below.
 // A sample played well below its reference note -- A. Piano 1 note 43 runs at step
 // 0.2952, i.e. a 9450 Hz source -- repeats its spectrum every 9450 Hz, and the kernel is
 // the only thing suppressing those copies.  Linear rejects an image of 1 kHz content by
@@ -85,7 +93,7 @@ static double const *sinc_table()
 
 static int recon_mode()
 {
-	static int const mode = getenv("U110_RECON") ? atoi(getenv("U110_RECON")) : 0;
+	static int const mode = getenv("U110_RECON") ? atoi(getenv("U110_RECON")) : 1;
 	return mode;
 }
 
