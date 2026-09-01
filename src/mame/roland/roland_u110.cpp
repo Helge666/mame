@@ -139,7 +139,8 @@
       detune doublet on chorused patches that the emulator does not reproduce.
     - The LCD controller part is unidentified and its CGROM undumped; the base MSM6222B is
       used with a synthesised font (see tools/make_lcd_cgrom.py), flagged BAD_DUMP.
-    - MIDI OUT / THRU are logged, not serialised to a port.
+    - MIDI OUT is serialised to a midi_port.  MIDI THRU is a separate jack and is not
+      emulated -- see the note in u110() where the port is created.
     - PORT1 bit 4 unexplained.
 
     References:
@@ -169,6 +170,7 @@
 #include "sound/flt_rc.h"
 #include "speaker.h"
 
+#include <array>
 #include <bit>
 
 
@@ -194,6 +196,7 @@ public:
 		, m_eq(*this, "eq%u", 1U)
 		, m_lcd(*this, "lcd")
 		, m_cards(*this, "cardslot%u", 1U)
+		, m_mdout(*this, "mdout")
 		, m_pcmrom(*this, "pcm")
 		, m_patchview(*this, "patchview")
 		, m_sw(*this, "SW")
@@ -248,6 +251,8 @@ private:
 
 	// MIDI
 	void midi_tx_w(u16 data);
+	void midi_tx_start();
+	TIMER_CALLBACK_MEMBER(midi_tx_cb);
 	void midi_rxd_w(int state);
 	TIMER_CALLBACK_MEMBER(midi_rx_cb);
 
@@ -274,6 +279,7 @@ private:
 	required_device_array<filter_biquad_device, 2> m_eq;
 	required_device<msm6222b_device> m_lcd;
 	required_device_array<generic_slot_device, 4> m_cards;
+	required_device<midi_port_device> m_mdout;
 	required_region_ptr<u8> m_pcmrom;
 	memory_view m_patchview;
 	required_ioport m_sw;
@@ -288,6 +294,16 @@ private:
 	int m_rxd = 1;
 	int m_rx_bit = -1;
 	u8 m_rx_data = 0;
+
+	// MIDI OUT.  The CPU core hands over whole bytes, so the 31250 baud 8N1 stream is
+	// generated here -- the mirror image of the receiver above.  m_tx_bit is -1 when the
+	// line is idle, 0-7 while a data bit is pending, 8 for the stop bit.
+	emu_timer *m_midi_tx_timer = nullptr;
+	int m_tx_bit = -1;
+	u8 m_tx_data = 0;
+	u8 m_tx_fifo[16]{};
+	u8 m_tx_head = 0, m_tx_tail = 0;
+	bool m_trace_midi_tx = true;
 
 	u8  m_snd_regs[0x20]{};     // shadow of what the CPU wrote, for the read port and tracing
 	u8  m_stat_idx = 0;     // voice index written to sound-chip register 0x10 / 0x12
@@ -707,10 +723,66 @@ void roland_u110_state::update_voice_routing()
     MIDI
 **************************************************************************************/
 
+// The CPU core delivers whole bytes through serial_tx_cb, so the 31250 baud 8N1 stream
+// has to be generated here -- the mirror image of the receiver below.
+//
+// A FIFO sits between the two because the CPU's transmit model and the real bit clock are
+// independent: i8x9x_device::serial_send() arms its "sent" callback 9600 cycles after the
+// write, which at this clock is slower than the 320 us a byte actually takes on the wire,
+// so in practice the queue never holds more than one byte.  It is here so that if the
+// firmware ever does write SBUF back-to-back the bytes queue instead of being silently
+// overwritten mid-shift, which would corrupt a bulk dump in a way that is very hard to see.
 void roland_u110_state::midi_tx_w(u16 data)
 {
-	// TODO: serialise to a midi_port so MIDI OUT / THRU reach the host.
-	logerror("MIDI OUT %02X\n", data & 0xff);
+	u8 const byte = u8(data & 0xff);
+	if (m_trace_midi_tx)
+		logerror("MIDI OUT %02X\n", byte);
+
+	u8 const next = (m_tx_head + 1) % u8(std::size(m_tx_fifo));
+	if (next == m_tx_tail)
+	{
+		logerror("MIDI OUT overrun: byte %02X dropped\n", byte);
+		return;
+	}
+	m_tx_fifo[m_tx_head] = byte;
+	m_tx_head = next;
+
+	if (m_tx_bit < 0)
+		midi_tx_start();
+}
+
+// Begin the next queued byte, or leave the line idle high if there is none.
+void roland_u110_state::midi_tx_start()
+{
+	if (m_tx_head == m_tx_tail)
+		return;
+
+	m_tx_data = m_tx_fifo[m_tx_tail];
+	m_tx_tail = (m_tx_tail + 1) % u8(std::size(m_tx_fifo));
+	m_tx_bit = 0;
+	m_mdout->write_txd(0);                  // start bit
+	m_midi_tx_timer->adjust(attotime::from_ticks(1, MIDI_BAUD));
+}
+
+TIMER_CALLBACK_MEMBER(roland_u110_state::midi_tx_cb)
+{
+	if (m_tx_bit < 8)
+	{
+		m_mdout->write_txd(BIT(m_tx_data, m_tx_bit));   // LSB first, as the receiver expects
+		m_tx_bit ++;
+		m_midi_tx_timer->adjust(attotime::from_ticks(1, MIDI_BAUD));
+	}
+	else if (m_tx_bit == 8)
+	{
+		m_mdout->write_txd(1);              // stop bit
+		m_tx_bit ++;
+		m_midi_tx_timer->adjust(attotime::from_ticks(1, MIDI_BAUD));
+	}
+	else
+	{
+		m_tx_bit = -1;                      // idle high; start the next byte if one is queued
+		midi_tx_start();
+	}
 }
 
 // MAME's midi_port is bit-level, but this CPU core takes whole bytes through serial_w(),
@@ -920,11 +992,17 @@ void roland_u110_state::machine_start()
 {
 	m_lcd_timer = timer_alloc(FUNC(roland_u110_state::lcd_int_cb), this);
 	m_midi_rx_timer = timer_alloc(FUNC(roland_u110_state::midi_rx_cb), this);
+	m_midi_tx_timer = timer_alloc(FUNC(roland_u110_state::midi_tx_cb), this);
 
 	save_item(NAME(m_snd_regs));
 	save_item(NAME(m_card_present));
 	save_item(NAME(m_port2));
 	save_item(NAME(m_leds));
+	save_item(NAME(m_tx_bit));
+	save_item(NAME(m_tx_data));
+	save_item(NAME(m_tx_fifo));
+	save_item(NAME(m_tx_head));
+	save_item(NAME(m_tx_tail));
 }
 
 void roland_u110_state::update_eq()
@@ -983,6 +1061,11 @@ INPUT_CHANGED_MEMBER(roland_u110_state::gain_key)
 
 void roland_u110_state::machine_reset()
 {
+	// MIDI OUT idles high; nothing has been sent yet.
+	m_mdout->write_txd(1);
+	m_tx_bit = -1;
+	m_tx_head = m_tx_tail = 0;
+
 	update_eq();       // a saved configuration may have switched it off
 	update_gain(false);   // ...and may carry a saved output gain
 	m_patchview.select(0);
@@ -1145,6 +1228,18 @@ void roland_u110_state::u110(machine_config &config)
 	// MIDI IN (JK1 -> IC2 opto-isolator -> CPU RXD, pin 18)
 	midi_port_device &mdin(MIDI_PORT(config, "mdin", midiin_slot, "midiin"));
 	mdin.rxd_handler().set(FUNC(roland_u110_state::midi_rxd_w));
+
+	// MIDI OUT (CPU TXD, pin 17).  The firmware sends nothing unprompted -- there is no
+	// active sensing and no keyboard -- so this carries bulk dumps and SysEx replies only.
+	//
+	// `[?]` MIDI THRU is a THIRD jack and is NOT wired here.  The owner's manual says
+	// "the MIDI messages fed into the MIDI IN connector are output through the MIDI THRU
+	// connector", which describes a hardware pass-through buffered off the opto-isolator,
+	// not something the CPU generates.  analysis/SYSTEM-DESIGN.md 6 currently lumps OUT and
+	// THRU together on TXD; that is unverified and probably wrong.  Emulating THRU as a
+	// copy of OUT would be actively misleading, so it is left out until the schematic
+	// settles it.
+	MIDI_PORT(config, m_mdout, midiout_slot, "midiout");
 }
 
 
