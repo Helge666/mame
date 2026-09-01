@@ -706,7 +706,7 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 		for (int smpl = 0; smpl < stream.samples(); smpl ++)
 		{
 			s32 smp_raw;
-			if (recon_mode() == 3 && chn.play_dir > 0)
+			if (recon_mode() == 3 && chn.play_dir > 0 && chn.step <= 0x4000)
 			{
 				// Catmull-Rom.  The three kernels measured before this one bracket the
 				// hardware: in the stopband linear (sinc^2) is 11 dB too bright and a
@@ -743,9 +743,19 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 				}
 				smp_raw = (s32)(v * 16384.0);
 			}
-			else if (recon_mode() == 1)
+			else if (recon_mode() == 1 && chn.play_dir > 0 && chn.step <= 0x4000)
 			{
-				// Quadratic B-spline.  Weights sum to 1; the kernel is one order wider
+				// Quadratic B-spline.  Weights sum to 1;
+				//
+				// STEP <= 1 ONLY, and the gate is not optional.  smpl_cur and smpl_nxt are
+				// always adjacent bytes, but the third tap comes from the previous OUTPUT
+				// sample, which is `step` bytes back -- one byte or two, depending where
+				// the fraction lands.  Above step 1 that makes the three taps irregularly
+				// spaced while these weights assume unit spacing, and the spacing pattern
+				// beats against the fractional part of the step: at P-27 Synth Bass note 57
+				// (steps 1.1279 and 1.3351, loops of 123 and 97 bytes) it beats every ~8
+				// output samples on a strongly periodic tone, which is plainly audible as
+				// roughness.  Linear uses only the adjacent pair and is unaffected. the kernel is one order wider
 				// than the triangle a linear interpolation convolves with, which costs a
 				// constant half-source-sample of delay and buys a factor of sinc.
 				double const t = double(chn.addr & 0x3FFF) / 16384.0;
