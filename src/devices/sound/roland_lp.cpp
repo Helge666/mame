@@ -37,6 +37,20 @@ static bool env_trace_enabled()
 //   1  round it to nearest instead -- one adder in hardware, and it removes the -0.5 LSB
 //      DC bias that flooring leaves
 //   2  carry the 14 fractional bits into the envelope multiply and quantise once, later
+// Reconstruction kernel, for the image-rejection investigation.  U110_RECON=
+//   0  linear interpolation between the two neighbouring samples (sinc^2)
+//   1  quadratic B-spline over three (sinc^3)
+// A sample played well below its reference note -- A. Piano 1 note 43 runs at step
+// 0.2952, i.e. a 9450 Hz source -- repeats its spectrum every 9450 Hz, and the kernel is
+// the only thing suppressing those copies.  Linear rejects an image of 1 kHz content by
+// 37 dB; one more order rejects it by 55 dB, while barely changing an image of 4 kHz
+// content.  That asymmetry is the shape of the measured error.
+static int recon_mode()
+{
+	static int const mode = getenv("U110_RECON") ? atoi(getenv("U110_RECON")) : 0;
+	return mode;
+}
+
 static int interp_mode()
 {
 	static int const mode = getenv("U110_INTERP") ? atoi(getenv("U110_INTERP")) : 0;
@@ -388,7 +402,7 @@ void mb87419_mb87420_device::write(offs_t offset, u8 data)
 						chn.pp_off = 0.0;
 						chn.addr = chn.start;
 						offs_t addr = (chn.addr >> 14) | ((chn.bank & 0x3C00) << 8);
-						chn.smpl_cur = 0;
+						chn.smpl_cur = chn.smpl_prv = 0;
 						chn.smpl_nxt = (m_pcm_mode == PCM_LINEAR8)
 								? (int16_t)(int8_t)read_byte(addr) * 16
 								: (m_pcm_mode == PCM_FLOAT8_DELTA)
@@ -649,7 +663,22 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 
 		for (int smpl = 0; smpl < stream.samples(); smpl ++)
 		{
-			s32 const smp_raw = (chn.play_dir > 0)
+			s32 smp_raw;
+			if (recon_mode() == 1)
+			{
+				// Quadratic B-spline.  Weights sum to 1; the kernel is one order wider
+				// than the triangle a linear interpolation convolves with, which costs a
+				// constant half-source-sample of delay and buys a factor of sinc.
+				double const t = double(chn.addr & 0x3FFF) / 16384.0;
+				double const a = (chn.play_dir > 0) ? chn.smpl_prv : chn.smpl_nxt;
+				double const c = (chn.play_dir > 0) ? chn.smpl_nxt : chn.smpl_prv;
+				double const v = 0.5 * (1.0 - t) * (1.0 - t) * a
+						+ (0.75 - (t - 0.5) * (t - 0.5)) * double(chn.smpl_cur)
+						+ 0.5 * t * t * c;
+				smp_raw = (s32)(v * 16384.0);
+			}
+			else
+				smp_raw = (chn.play_dir > 0)
 					? sample_interpolate_raw(chn.smpl_cur, chn.smpl_nxt, chn.addr & 0x3FFF)
 					: sample_interpolate_raw(chn.smpl_nxt, chn.smpl_cur, chn.addr & 0x3FFF);
 			// Mode 2 keeps the fraction and lets the envelope multiply see it; 0 and 1
@@ -877,6 +906,7 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 					// pair either side of a turn must each carry its own.  smpl_cur cannot
 					// be the previous smpl_nxt any more: with a step over one byte the
 					// previous fetch is not the neighbouring byte.
+					chn.smpl_prv = chn.smpl_cur;
 					chn.smpl_cur = (int16_t)std::clamp(
 							chn.pp_sign * chn.acc_prev + chn.pp_off, -8191.0, +8191.0);
 					chn.smpl_nxt = (int16_t)std::clamp(
@@ -891,6 +921,7 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 				offs_t const bank_base = (chn.bank & 0x3C00) << 8;
 				offs_t addr = (chn.addr >> 14) | bank_base;
 				//logerror("Chn %u: sample addr 0x%05X.%03X\n", &chn - &m_chns[0], chn.addr >> 14, (chn.addr & 0x3FFF) << 2);
+				chn.smpl_prv = chn.smpl_cur;
 				chn.smpl_cur = chn.smpl_nxt;
 				if (m_pcm_mode == PCM_FLOAT8)
 				{

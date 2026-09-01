@@ -153,6 +153,7 @@ private:
 		int8_t play_dir = 0;    // playing direction, -1 [backwards] / 0 [stopped] / +1 [forwards]
 		uint32_t addr = 0;      // current address
 		int16_t smpl_cur = 0;   // current sample
+		int16_t smpl_prv = 0;   // the one before it, for the wider reconstruction kernel
 		int16_t smpl_nxt = 0;   // next sample
 		double  acc = 0.0;      // PCM_FLOAT8_DELTA: the running sum of the deltas
 		double  acc_prev = 0.0; // ...and its value one fetch earlier
