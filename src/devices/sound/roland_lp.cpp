@@ -706,7 +706,31 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 		for (int smpl = 0; smpl < stream.samples(); smpl ++)
 		{
 			s32 smp_raw;
-			if (recon_mode() == 2 && chn.play_dir > 0 && chn.step <= 0x4000)
+			if (recon_mode() == 3 && chn.play_dir > 0)
+			{
+				// Catmull-Rom.  The three kernels measured before this one bracket the
+				// hardware: in the stopband linear (sinc^2) is 11 dB too bright and a
+				// 16-tap windowed sinc 13 dB too dark, while the quadratic B-spline
+				// (sinc^3) lands at 1.9; in the passband linear is 4 dB too dark and the
+				// sinc is right.  So the chip wants a FLAT passband with a stopband
+				// between sinc^2 and sinc^3, which is an interpolating cubic -- and four
+				// taps is buildable silicon in a way a polyphase FIR is not.
+				//
+				// Evaluated one source sample behind so the fourth tap comes from history
+				// rather than needing a look-ahead; that costs a constant delay of one
+				// source sample and nothing else.
+				double const t = double(chn.addr & 0x3FFF) / 16384.0;
+				double const p3 = chn.smpl_nxt;
+				double const p2 = chn.hist[chn.hist_pos];
+				double const p1 = chn.hist[(chn.hist_pos + HIST_LEN - 1) % HIST_LEN];
+				double const p0 = chn.hist[(chn.hist_pos + HIST_LEN - 2) % HIST_LEN];
+				double const v = 0.5 * ((2.0 * p1)
+						+ (-p0 + p2) * t
+						+ (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t * t
+						+ (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t * t * t);
+				smp_raw = (s32)(v * 16384.0);
+			}
+			else if (recon_mode() == 2 && chn.play_dir > 0 && chn.step <= 0x4000)
 			{
 				double const *const k = sinc_table()
 						+ (((chn.addr & 0x3FFF) * SINC_PHASES) >> 14) * SINC_TAPS;
