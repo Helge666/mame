@@ -139,8 +139,8 @@
       detune doublet on chorused patches that the emulator does not reproduce.
     - The LCD controller part is unidentified and its CGROM undumped; the base MSM6222B is
       used with a synthesised font (see tools/make_lcd_cgrom.py), flagged BAD_DUMP.
-    - MIDI OUT is serialised to a midi_port.  MIDI THRU is a separate jack and is not
-      emulated -- see the note in u110() where the port is created.
+    - MIDI OUT is serialised to a midi_port; MIDI THRU is passed through from MIDI IN,
+      as the hardware does.
     - PORT1 bit 4 unexplained.
 
     References:
@@ -197,6 +197,7 @@ public:
 		, m_lcd(*this, "lcd")
 		, m_cards(*this, "cardslot%u", 1U)
 		, m_mdout(*this, "mdout")
+		, m_mdthru(*this, "mdthru")
 		, m_pcmrom(*this, "pcm")
 		, m_patchview(*this, "patchview")
 		, m_sw(*this, "SW")
@@ -280,6 +281,7 @@ private:
 	required_device<msm6222b_device> m_lcd;
 	required_device_array<generic_slot_device, 4> m_cards;
 	required_device<midi_port_device> m_mdout;
+	required_device<midi_port_device> m_mdthru;
 	required_region_ptr<u8> m_pcmrom;
 	memory_view m_patchview;
 	required_ioport m_sw;
@@ -790,6 +792,14 @@ TIMER_CALLBACK_MEMBER(roland_u110_state::midi_tx_cb)
 // bit; sample 1.5 bit times later, then once per bit time.
 void roland_u110_state::midi_rxd_w(int state)
 {
+	// MIDI THRU is a wire, not a feature: the service manual shows JK3 driven straight from
+	// IC2's output, the same node that feeds the CPU's RXD.  No CPU involvement, no
+	// deserialising, no buffering -- so the line state is simply passed along, bit for bit,
+	// and THRU keeps working even while the firmware is busy or halted.  (Owner's manual:
+	// "the MIDI messages fed into the MIDI IN connector are output through the MIDI THRU
+	// connector".)
+	m_mdthru->write_txd(state);
+
 	if (m_rx_bit < 0 && m_rxd && !state)
 	{
 		m_rx_bit = 0;
@@ -1232,14 +1242,10 @@ void roland_u110_state::u110(machine_config &config)
 	// MIDI OUT (CPU TXD, pin 17).  The firmware sends nothing unprompted -- there is no
 	// active sensing and no keyboard -- so this carries bulk dumps and SysEx replies only.
 	//
-	// `[?]` MIDI THRU is a THIRD jack and is NOT wired here.  The owner's manual says
-	// "the MIDI messages fed into the MIDI IN connector are output through the MIDI THRU
-	// connector", which describes a hardware pass-through buffered off the opto-isolator,
-	// not something the CPU generates.  analysis/SYSTEM-DESIGN.md 6 currently lumps OUT and
-	// THRU together on TXD; that is unverified and probably wrong.  Emulating THRU as a
-	// copy of OUT would be actively misleading, so it is left out until the schematic
-	// settles it.
 	MIDI_PORT(config, m_mdout, midiout_slot, "midiout");
+
+	// MIDI THRU (JK3), buffered off the IC2 opto-isolator output -- see midi_rxd_w().
+	MIDI_PORT(config, m_mdthru, midiout_slot, "midiout");
 }
 
 
