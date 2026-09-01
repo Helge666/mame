@@ -128,6 +128,7 @@ protected:
 
 	static int16_t decode_sample(int8_t data);
 	static int16_t sample_interpolate(int16_t smp1, int16_t smp2, uint16_t frac);
+	static int32_t sample_interpolate_raw(int16_t smp1, int16_t smp2, uint16_t frac);
 
 	TIMER_CALLBACK_MEMBER(env_tick);
 

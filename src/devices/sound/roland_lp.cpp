@@ -32,6 +32,17 @@ static bool env_trace_enabled()
 }
 #define ENV_TRACE env_trace_enabled()
 
+// Interpolator precision, for the 6-9 kHz brightness investigation.  U110_INTERP=
+//   0  truncate the interpolated sample to a 12-bit integer (the historical behaviour)
+//   1  round it to nearest instead -- one adder in hardware, and it removes the -0.5 LSB
+//      DC bias that flooring leaves
+//   2  carry the 14 fractional bits into the envelope multiply and quantise once, later
+static int interp_mode()
+{
+	static int const mode = getenv("U110_INTERP") ? atoi(getenv("U110_INTERP")) : 0;
+	return mode;
+}
+
 #include <cmath>
 
 
@@ -638,11 +649,20 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 
 		for (int smpl = 0; smpl < stream.samples(); smpl ++)
 		{
+			s32 const smp_raw = (chn.play_dir > 0)
+					? sample_interpolate_raw(chn.smpl_cur, chn.smpl_nxt, chn.addr & 0x3FFF)
+					: sample_interpolate_raw(chn.smpl_nxt, chn.smpl_cur, chn.addr & 0x3FFF);
+			// Mode 2 keeps the fraction and lets the envelope multiply see it; 0 and 1
+			// quantise here, flooring or rounding.  smp_scale carries the divisor mode 2
+			// still owes.
+			double smp_scale = 1.0;
 			s32 smp_data;
-			if (chn.play_dir > 0)
-				smp_data = sample_interpolate(chn.smpl_cur, chn.smpl_nxt, chn.addr & 0x3FFF);
-			else
-				smp_data = sample_interpolate(chn.smpl_nxt, chn.smpl_cur, chn.addr & 0x3FFF);
+			switch (interp_mode())
+			{
+			case 1:  smp_data = (smp_raw + 0x2000) >> 14; break;
+			case 2:  smp_data = smp_raw; smp_scale = 1.0 / 16384.0; break;
+			default: smp_data = smp_raw >> 14; break;
+			}
 			// Note the casts: volume_gain() returns uint32_t, and s32 * uint32_t is
 			// evaluated UNSIGNED, so a negative sample would wrap to a huge positive
 			// value before the envelope multiply ever saw it.
@@ -652,7 +672,7 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 				// got to, on the same 0..2^26 scale full output sits at.  volume_gain()'s
 				// 16-bit result is what the mixer's 32768 << 14 divisor expects, so scale
 				// to that.
-				smp_data = (s32)((double)smp_data * chn.env_level * (65536.0 / ENV_FULL));
+				smp_data = (s32)((double)smp_data * smp_scale * chn.env_level * (65536.0 / ENV_FULL));
 
 				if (chn.env_rate > 0.0)
 				{
@@ -677,7 +697,7 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 			}
 			else
 			{
-				smp_data = (s32)((double)smp_data * (double)volume_gain(chn.volume) * chn.env);
+				smp_data = (s32)((double)smp_data * smp_scale * (double)volume_gain(chn.volume) * chn.env);
 				chn.env *= chn.releasing ? m_env_release_step : m_env_decay_step;
 				if (chn.releasing && chn.env < 6.0e-5)   // -84 dB: below the DAC's own floor
 				{
@@ -980,7 +1000,19 @@ int16_t mb87419_mb87420_device::decode_sample(int8_t data)
 
 int16_t mb87419_mb87420_device::sample_interpolate(int16_t smp1, int16_t smp2, uint16_t frac)
 {
-	int32_t smpfrac0 = (int32_t)smp1 * (0x4000 - frac);
-	int32_t smpfrac1 = (int32_t)smp2 * frac;
-	return (int16_t)((smpfrac0 + smpfrac1) >> 14);
+	return (int16_t)(sample_interpolate_raw(smp1, smp2, frac) >> 14);
+}
+
+// The same interpolation with the 14 fractional bits still attached.  smp1 and smp2 span
+// +/-2048, so this spans +/-2048 << 14 and cannot overflow a s32.
+//
+// Which of the two the mixer uses is the question U110_INTERP exists to answer.  The
+// truncating form above quantises every voice to a 12-bit integer BEFORE the envelope
+// multiplies it, so its error is signal-scaled -- it follows the note down instead of
+// sitting at a fixed floor, which is exactly the shape of the 6-9 kHz excess.
+int32_t mb87419_mb87420_device::sample_interpolate_raw(int16_t smp1, int16_t smp2, uint16_t frac)
+{
+	int32_t const smpfrac0 = (int32_t)smp1 * (0x4000 - frac);
+	int32_t const smpfrac1 = (int32_t)smp2 * frac;
+	return smpfrac0 + smpfrac1;
 }
