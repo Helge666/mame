@@ -243,6 +243,7 @@ private:
 	void env_advance_slot(pcm_channel &chn, unsigned slot, int samples,
 			std::vector<double> *trace);
 	void fx_render(sound_stream &stream);
+	float fx_tap(double distance) const;
 
 	devcb_write_line m_int_callback;
 

@@ -716,6 +716,30 @@ void mb87419_mb87420_device::env_advance_slot(pcm_channel &chn, unsigned slot, i
 // and there is nothing in between two of its bytes.  The small step the tap makes as it
 // crosses a sample boundary is part of the sound.
 // -------------------------------------------------------------------------------------
+// Read the delay line at a FRACTIONAL distance back, interpolating between the two
+// neighbouring samples.
+//
+// `[C]` The tap was integer, on the reasoning that an eleven-wire address cannot be
+// fractional.  That is true of the ADDRESS and false of the output: a delay whose length
+// steps by whole samples emits a discontinuity at every step, and the step RATE is the tap
+// range divided by half the LFO period -- so it scales with DEPTH.  At depth 1 that is a
+// few dozen clicks a second; at depth 15 it is near a kilohertz, which ring-modulates the
+// tone.  Both were audible in the plugin and neither is on the hardware, which is what
+// says the real chip interpolates.  Measured on note 83, chorus rate 1: sidebands at
+// f0 +/- 990 Hz sat 37 dB below the peak with the integer tap.
+//
+// Linear is the cheapest thing that removes it and is almost certainly what the chip does;
+// nothing in the captures distinguishes linear from anything fancier.
+float mb87419_mb87420_device::fx_tap(double distance) const
+{
+	double const d = std::clamp(distance, 1.0, double(FX_DELAY_LEN - 2));
+	u32 const i = u32(d);
+	float const frac = float(d - double(i));
+	float const a = m_fx_line[(m_fx_pos - i) & (FX_DELAY_LEN - 1)];
+	float const b = m_fx_line[(m_fx_pos - i - 1) & (FX_DELAY_LEN - 1)];
+	return a + (b - a) * frac;
+}
+
 void mb87419_mb87420_device::fx_render(sound_stream &stream)
 {
 	bool const chorus = BIT(m_fx_config, 3);
@@ -732,14 +756,10 @@ void mb87419_mb87420_device::fx_render(sound_stream &stream)
 		if (chorus && csum > 0.0)
 		{
 			double const g = m_fx_lfo[0][smpl];
-			u32 const dl = std::clamp<u32>(u32(g / double(1u << FX_TAP_SHIFT)),
-					1, FX_DELAY_LEN - 1);
-			u32 const dr = std::clamp<u32>(u32(std::max(csum - g, 0.0) / double(1u << FX_TAP_SHIFT)),
-					1, FX_DELAY_LEN - 1);
 			wet_l += sound_stream::sample_t(FX_CHORUS_MIX
-					* m_fx_line[(m_fx_pos - dl) & (FX_DELAY_LEN - 1)]);
+					* fx_tap(g / double(1u << FX_TAP_SHIFT)));
 			wet_r += sound_stream::sample_t(FX_CHORUS_MIX
-					* m_fx_line[(m_fx_pos - dr) & (FX_DELAY_LEN - 1)]);
+					* fx_tap(std::max(csum - g, 0.0) / double(1u << FX_TAP_SHIFT)));
 		}
 		if (tremolo && tsum > 0.0)
 		{
