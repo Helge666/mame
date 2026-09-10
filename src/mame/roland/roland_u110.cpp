@@ -92,7 +92,7 @@
     oscillator.  With MAME's /1024 the emulator ran +104 cents sharp, and
     1200*log2(34000/32000) = +104.96.  Set with set_rate_divider(1088).
 
-    Four fixes were needed outside this driver:
+    Five fixes were needed outside this driver:
       1. i8x9x.cpp gated the HSI.0 interrupt on IOC1 bit 1.  This firmware sets IOC1 = 0x21
          (bit 1 clear, EXTINT on the pin for the sound chip) while enabling INT_MASK bit 4
          for HSI.0 from IC8, so the two were mutually exclusive, the LCD text ring at 0x2700
@@ -111,6 +111,12 @@
          silent.  The switch is `audio_dither_enabled()` in emu/sound.h; it defaults ON.
          This one is core MAME, not a device, so it affects every driver and it does NOT
          reach the plugin -- the plugin hands float to its host and has no s16 stage at all.
+      5. i8x9x.cpp's port1_r() returned `m_in_p1_cb() & port1`, which cannot survive a
+         read-modify-write of the port.  This firmware writes three (`orb port1,#10` at
+         0x6AFE and 0xB759, `andb port1,#ef` at 0xC0EC), so the card-presence pins were
+         read, carried into the output latch and never released: after the first note
+         played, a slot that held a card read "present" for ever and the firmware's card
+         poller never saw a card leave.  The low nibble now comes from the board.
 
     KNOWN DEFECT
     ------------
@@ -141,7 +147,6 @@
       used with a synthesised font (see tools/make_lcd_cgrom.py), flagged BAD_DUMP.
     - MIDI OUT is serialised to a midi_port; MIDI THRU is passed through from MIDI IN,
       as the hardware does.
-    - PORT1 bit 4 unexplained.
 
     References:
       analysis/ROM-ANALYSIS.md   - firmware structures, register protocol, card format
@@ -501,6 +506,10 @@ u8 roland_u110_state::switch_r(offs_t offset)
 
 // PORT1 bits 0-3: cartridge presence, ACTIVE LOW.  The firmware writes 0xFF to PORT1 at
 // 0x4378 (the quasi-bidirectional input idiom), so unpopulated lines read high.
+//
+// These are polled every service pass and a card is mounted or dismounted on the edge, so
+// a card may be changed while the machine runs -- which is what the media slots below let
+// a user do.  analysis/ROM-ANALYSIS.md section 6.9.
 u8 roland_u110_state::port1_r()
 {
 	return 0xf0 | m_card_present;
@@ -508,7 +517,11 @@ u8 roland_u110_state::port1_r()
 
 void roland_u110_state::port1_w(u8 data)
 {
-	// bit 4 is driven around card operations; purpose not established (open question #4)
+	// Bit 4 is a TONE-GENERATOR BUSY FLAG the firmware keeps in the port register: cleared
+	// at the head of the start-a-note routine (0xC0EC), set again once the voice queues
+	// drain (0x6AFE) and after the LSI init spin (0xB759), and read back with
+	// `jbs port1,4` at 0x6AF1.  Nothing on the board appears to be listening.
+	// analysis/ROM-ANALYSIS.md section 6.9.
 	logerror("%s: PORT1 = %02X\n", machine().describe_context(), data);
 }
 

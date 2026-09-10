@@ -306,7 +306,27 @@ u8 i8x9x_device::port1_r()
 	if (!i8x9x_has_p1())
 		return 0xff;
 
-	return m_in_p1_cb() & port1;
+	// A pin the BOARD drives reads as the board drives it, whatever the output latch
+	// holds.  `in & port1` alone cannot survive a read-modify-write of this SFR, and
+	// firmware writes one: the U-110's `orb port1,#10` (0x6AFE, 0xB759) and
+	// `andb port1,#ef` (0xC0EC) keep a tone-generator busy flag in bit 4.  Each one
+	// reads the port -- getting the four card-presence pins with it -- and writes the
+	// result back, folding those pins into the latch permanently.  After the first note
+	// played, every slot that held a card at that moment reads "present" for ever, and
+	// the firmware's card poller at 0x6E37 never sees a card leave.
+	//
+	// The general fix is the one MAME's MCS-51 core already makes: a read-modify-write
+	// instruction reads the LATCH, not the pins.  That needs the opcode layer to say
+	// which reads are which, so this is the narrow version: the low nibble is the
+	// board's, the high nibble keeps the old behaviour, which is what lets the U-110's
+	// bit-4 flag read back as written.
+	//
+	// Two drivers connect PORT1 at all.  The U-110 has four card-presence inputs in the
+	// low nibble.  The D-70 drives the whole port as a scan bus, and its input callback
+	// returns the value the CPU last wrote, so `in & port1` and this are the same value
+	// there and it cannot be affected.
+	const u8 in = m_in_p1_cb();
+	return (in & 0x0f) | (in & port1 & 0xf0);
 }
 
 void i8x9x_device::port2_w(u8 data)
