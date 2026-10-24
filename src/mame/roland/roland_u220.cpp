@@ -433,8 +433,7 @@ u8 roland_u220_state::pcm_r(offs_t offset)
 		if (m_romrd_log < 400)
 		{
 			m_romrd_log++;
-			logerror("ROMRD pc=%04X phase=%08X bank=%04X -> %06X = %02X
-", m_maincpu->pc(), phase, bank, addr, data);
+			logerror("ROMRD pc=%04X phase=%08X bank=%04X -> %06X = %02X\n", m_maincpu->pc(), phase, bank, addr, data);
 		}
 		return data;
 	}
