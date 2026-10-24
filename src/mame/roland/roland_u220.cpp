@@ -82,6 +82,7 @@ public:
 		, m_maincpu(*this, "maincpu")
 		, m_progrom(*this, "progrom")
 		, m_nvram(*this, "nvram")
+		, m_keys(*this, "KEYS")
 	{
 	}
 
@@ -124,6 +125,7 @@ private:
 	u8 m_pcmreg[0x20] = {};             // PCM chip registers, until the device is wired
 	u8 m_effreg[0x80] = {};             // effect processor, until it is understood
 	required_device<nvram_device> m_nvram;
+	required_ioport m_keys;
 	std::unique_ptr<u8[]> m_ram;        // IC10, 32 KB, battery backed
 	std::unique_ptr<u8[]> m_low;        // 0x0100-0x07FF, in case it is RAM after all
 
@@ -199,10 +201,15 @@ u8 roland_u220_state::window_r(offs_t offset)
 		note('l', 0x800 + offset, data);
 		break;
 	case 0x3:                                           // key matrix
-		// Active low: the scan at 0xE1A2 forces the two unused bits of 080D high and
-		// inverts the word, so all ones is "nothing pressed".
-		data = 0xff;
-		note('k', 0x800 + offset, data);
+		// Active low, 14 bits: 080E is bits 0-7, 080D bits 8-13 (the scan at 0xE1A2 sets
+		// the top two itself and inverts the word).  Bit n becomes key code
+		// E194[n]: 6A-6F, 76, 77, 52-57.
+		if (offset == 0x0e)
+			data = m_keys->read() & 0xff;
+		else if (offset == 0x0d)
+			data = (m_keys->read() >> 8) | 0xc0;
+		else
+			note('k', 0x800 + offset, data);
 		break;
 	case 0x4:                                           // effect processor?
 		data = m_effreg[offset & 0x7f];
@@ -368,6 +375,23 @@ void roland_u220_state::mem_map(address_map &map)
 }
 
 static INPUT_PORTS_START(u220)
+	// Which bit is which key is being worked out; named by bit for now.
+	PORT_START("KEYS")
+	PORT_BIT(0x0001, IP_ACTIVE_LOW, IPT_BUTTON1)  PORT_NAME("Key bit 0 (6A)")
+	PORT_BIT(0x0002, IP_ACTIVE_LOW, IPT_BUTTON2)  PORT_NAME("Key bit 1 (6B)")
+	PORT_BIT(0x0004, IP_ACTIVE_LOW, IPT_BUTTON3)  PORT_NAME("Key bit 2 (6C)")
+	PORT_BIT(0x0008, IP_ACTIVE_LOW, IPT_BUTTON4)  PORT_NAME("Key bit 3 (6D)")
+	PORT_BIT(0x0010, IP_ACTIVE_LOW, IPT_BUTTON5)  PORT_NAME("Key bit 4 (6E)")
+	PORT_BIT(0x0020, IP_ACTIVE_LOW, IPT_BUTTON6)  PORT_NAME("Key bit 5 (6F)")
+	PORT_BIT(0x0040, IP_ACTIVE_LOW, IPT_BUTTON7)  PORT_NAME("Key bit 6 (76)")
+	PORT_BIT(0x0080, IP_ACTIVE_LOW, IPT_BUTTON8)  PORT_NAME("Key bit 7 (77)")
+	PORT_BIT(0x0100, IP_ACTIVE_LOW, IPT_BUTTON9)  PORT_NAME("Key bit 8 (52)")
+	PORT_BIT(0x0200, IP_ACTIVE_LOW, IPT_BUTTON10) PORT_NAME("Key bit 9 (53)")
+	PORT_BIT(0x0400, IP_ACTIVE_LOW, IPT_BUTTON11) PORT_NAME("Key bit 10 (54)")
+	PORT_BIT(0x0800, IP_ACTIVE_LOW, IPT_BUTTON12) PORT_NAME("Key bit 11 (55)")
+	PORT_BIT(0x1000, IP_ACTIVE_LOW, IPT_BUTTON13) PORT_NAME("Key bit 12 (56)")
+	PORT_BIT(0x2000, IP_ACTIVE_LOW, IPT_BUTTON14) PORT_NAME("Key bit 13 (57)")
+	PORT_BIT(0xc000, IP_ACTIVE_LOW, IPT_UNUSED)
 INPUT_PORTS_END
 
 void roland_u220_state::u220(machine_config &config)
