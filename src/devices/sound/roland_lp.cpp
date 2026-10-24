@@ -850,7 +850,7 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 	// load from the OUTPUT MODE's own config byte.  Bit 3 is chorus, bit 1 tremolo, and the
 	// firmware clears whichever one has a depth of zero, so "depth 0" arrives here as "off"
 	// rather than as a small effect.
-	bool const fx_on = m_env_engine && m_out_count > 2
+	bool const fx_on = m_env_engine && m_out_count > 2 && !m_gain_matrix
 			&& (BIT(m_fx_config, 1) || BIT(m_fx_config, 3));
 
 	if (m_env_engine)
@@ -1002,7 +1002,14 @@ void mb87419_mb87420_device::sound_stream_update(sound_stream &stream)
 			// gain / VOICE_FS -- see VOICE_FS in the header for where 2^27 comes from,
 			// and set_mix_gain_db() for the gain.
 			auto const out_smp = sound_stream::sample_t(double(smp_data) * m_out_scale);
-			if (m_out_count <= 2)
+			if (m_gain_matrix)
+			{
+				float const *const g = m_voice_gain[&chn - &m_chns[0]];
+				for (int out = 0; out < m_out_count && out < MAX_GAIN_OUTS; out ++)
+					if (g[out] != 0.0f)
+						stream.add(out, smpl, out_smp * g[out]);
+			}
+			else if (m_out_count <= 2)
 			{
 				// historical behaviour: every voice to both channels
 				stream.add(0, smpl, out_smp);

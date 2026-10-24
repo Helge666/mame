@@ -35,6 +35,15 @@ public:
 	void set_output_count(int count) { m_out_count = count; }
 	void set_voice_mask(u8 voice, u8 mask) { if (voice < NUM_CHANNELS) m_voice_mask[voice] = mask; }
 
+	// Output through a gain matrix instead: output k carries every voice times that voice's
+	// own gain for k.  The U-220 needs it -- its effect processor (IC25) pans each voice and
+	// sends it to the dry, reverb or chorus bus by coefficients the CPU rewrites at every
+	// note -- and it overrides the masks and the U-110 effect stage while it is on.
+	static constexpr int MAX_GAIN_OUTS = 8;
+	void set_gain_matrix(bool on) { m_gain_matrix = on; }
+	void set_voice_gain(u8 voice, int out, float gain)
+	{ if (voice < NUM_CHANNELS && out >= 0 && out < MAX_GAIN_OUTS) m_voice_gain[voice][out] = gain; }
+
 	// The envelope ramp generator, and the interrupt that drives it.  OFF by default, so
 	// the CM-32P / D-70 / R-8 / U-20 drivers keep the behaviour they were tuned against.
 	//
@@ -255,6 +264,8 @@ private:
 	pcm_mode m_pcm_mode = PCM_DIFFERENTIAL;
 	int m_out_count = 2;
 	u8 m_voice_mask[NUM_SLOTS];
+	bool m_gain_matrix = false;
+	float m_voice_gain[NUM_SLOTS][MAX_GAIN_OUTS] = {};
 	u32 m_rate_div = 1024;
 	double m_delta_dc_hz = 0.0;         // leak corner for PCM_FLOAT8_DELTA
 	double m_delta_keep = 1.0;          // per-sample retention derived from it
