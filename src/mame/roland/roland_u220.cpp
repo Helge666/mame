@@ -169,6 +169,7 @@ private:
 
 	std::set<std::tuple<char, offs_t, offs_t, u8>> m_seen;
 	const bool m_trace_tg = getenv("U220_TGTRACE") != nullptr;   // every chip register write
+	const u32 m_mute = getenv("U220_MUTE") ? u32(strtoul(getenv("U220_MUTE"), nullptr, 16)) : 0;
 
 	emu_timer *m_lcd_ready_timer = nullptr;
 	emu_timer *m_lcd_dump_timer = nullptr;
@@ -442,6 +443,10 @@ u8 roland_u220_state::pcm_r(offs_t offset)
 void roland_u220_state::pcm_w(offs_t offset, u8 data)
 {
 	m_pcmreg[offset] = data;
+	// U220_MUTE=mask (hex, bit per voice): an experiment switch that writes envelope target 0
+	// for those voices, to hear the others alone.
+	if (offset == 0x07 && BIT(m_mute, m_pcmreg[0x1f] & 0x1f))
+		data = 0;
 	m_pcm->write(offset, data);
 	if (m_trace_tg)
 		logerror("TG %f v%02X reg %02X = %02X\n", machine().time().as_double(), m_pcmreg[0x1f] & 0x1f, offset, data);
