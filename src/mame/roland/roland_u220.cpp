@@ -171,6 +171,8 @@ private:
 	const bool m_trace_tg = getenv("U220_TGTRACE") != nullptr;   // every chip register write
 	const offs_t m_watch_pc = getenv("U220_WATCHPC") ? offs_t(strtoul(getenv("U220_WATCHPC"), nullptr, 16)) : 0;
 	const u32 m_mute = getenv("U220_MUTE") ? u32(strtoul(getenv("U220_MUTE"), nullptr, 16)) : 0;
+	const u16 m_mute_start = getenv("U220_MUTE_START") ? u16(strtoul(getenv("U220_MUTE_START"), nullptr, 16)) : 0;
+	u16 m_vstart[32] = {};
 
 	emu_timer *m_lcd_ready_timer = nullptr;
 	emu_timer *m_lcd_dump_timer = nullptr;
@@ -449,6 +451,15 @@ void roland_u220_state::pcm_w(offs_t offset, u8 data)
 	// U220_MUTE=mask (hex, bit per voice): an experiment switch that writes envelope target 0
 	// for those voices, to hear the others alone.
 	if (offset == 0x07 && BIT(m_mute, m_pcmreg[0x1f] & 0x1f))
+		data = 0;
+	// U220_MUTE_START=hex: the same, for every voice whose sample starts at that address
+	// (registers 0B:0A), which follows a sample from voice to voice.
+	if (offset == 0x0a || offset == 0x0b)
+	{
+		u16 &st = m_vstart[m_pcmreg[0x1f] & 0x1f];
+		st = (offset == 0x0a) ? ((st & 0xff00) | data) : ((st & 0x00ff) | (data << 8));
+	}
+	if (offset == 0x07 && m_mute_start && m_vstart[m_pcmreg[0x1f] & 0x1f] == m_mute_start)
 		data = 0;
 	m_pcm->write(offset, data);
 	if (m_trace_tg)
