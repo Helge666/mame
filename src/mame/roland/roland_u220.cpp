@@ -388,6 +388,8 @@ void roland_u220_state::window_w(offs_t offset, u8 data)
 		note('E', 0x800 + offset, data);
 		break;
 	case 0x6:
+		if (m_trace_tg)
+			logerror("TGRAW %f off %03X = %02X\n", machine().time().as_double(), offset, data);
 		pcm_w(offset & 0x1f, data);
 		break;
 	default:
