@@ -168,6 +168,7 @@ private:
 	std::unique_ptr<u8[]> m_low;        // 0x0100-0x07FF, in case it is RAM after all
 
 	std::set<std::tuple<char, offs_t, offs_t, u8>> m_seen;
+	int m_romrd_log = 0;
 
 	emu_timer *m_lcd_ready_timer = nullptr;
 	emu_timer *m_lcd_dump_timer = nullptr;
@@ -428,7 +429,14 @@ u8 roland_u220_state::pcm_r(offs_t offset)
 				| (m_pcmreg[0x0a] << 16) | (m_pcmreg[0x0b] << 24);
 		const u16 bank = m_pcmreg[0x02] | (m_pcmreg[0x03] << 8);
 		const offs_t addr = (((phase >> 14) + PCM_READ_PREFETCH) & 0x3ffff) | ((bank & 0x3c00) << 8);
-		return m_pcmrom[addr & 0x3fffff];
+		const u8 data = m_pcmrom[addr & 0x3fffff];
+		if (m_romrd_log < 400)
+		{
+			m_romrd_log++;
+			logerror("ROMRD pc=%04X phase=%08X bank=%04X -> %06X = %02X
+", m_maincpu->pc(), phase, bank, addr, data);
+		}
+		return data;
 	}
 
 	default:
