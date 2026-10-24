@@ -34,7 +34,20 @@
                      0x1F80-0x1FFF; then writes 1..4 to 0x1000 calling one routine each
 
     So 0x1000/0x1001 are IC12 registers, 0x1002-0x1FFF is RAM, and 0x1000 selects what
-    the window at 0x0800-0x0FFF shows.  THAT window is what this revision instruments.
+    the window at 0x0800-0x0FFF shows -- a device, or a 2 KB page of ROM or RAM:
+
+      0x1000      window 0x0800-0x0FFF                      evidence
+      00-0F       PCM chip, CM-32P register layout          writes to 0811/13/15/17 (voice
+                                                            enable masks), 081F (voice select)
+      10-1F       LCD: 0800 command, 0801 data              the HSI0 handler at 0x2130
+      30-3F       key matrix: 080D, 080E                    the key scan at 0xE1A2
+      40-7F       program ROM, page (bank & 3F) * 2 KB      0x0815 with page 37 is ROM 0x1B815,
+                                                            "Internal Battery Low!", printed
+                                                            from 0x26C0
+      80-9F       SRAM pages                                working value 95, tables at 94/96
+
+    There is no code banking: 0x2000-0xFFFF is the lower 64 KB of the EPROM, fixed.  The
+    upper 64 KB is data, read through the window.
 
 *************************************************************************************************/
 
@@ -68,12 +81,8 @@ protected:
 private:
 	void mem_map(address_map &map) ATTR_COLD;
 
-	u8 rom_hi_r(offs_t offset);
-
 	u8 low_r(offs_t offset);
 	void low_w(offs_t offset, u8 data);
-	u8 ic12_r(offs_t offset);
-	void ic12_w(offs_t offset, u8 data);
 	u8 window_r(offs_t offset);
 	void window_w(offs_t offset, u8 data);
 	u8 bank_r();
@@ -97,8 +106,9 @@ private:
 
 	u8 m_bank = 0;
 	u8 m_reg1001 = 0;
-	u8 m_ic12[0x20] = {};
-	std::unique_ptr<u8[]> m_window;     // 256 banks x 2 KB, until the real map is known
+	u8 m_pcmreg[0x20] = {};             // PCM chip registers, until the device is wired
+	u8 m_keys[0x20] = {};
+	std::unique_ptr<u8[]> m_window;     // SRAM pages 80-9F, 32 x 2 KB until the size is known
 	std::unique_ptr<u8[]> m_low;        // 0x0100-0x07FF, in case it is RAM after all
 
 	std::set<std::tuple<char, offs_t, offs_t, u8>> m_seen;
@@ -114,13 +124,14 @@ private:
 
 void roland_u220_state::machine_start()
 {
-	m_window = std::make_unique<u8[]>(0x100 * 0x800);
+	m_window = std::make_unique<u8[]>(0x20 * 0x800);
 	m_low = std::make_unique<u8[]>(0x800);
-	save_pointer(NAME(m_window), 0x100 * 0x800);
+	save_pointer(NAME(m_window), 0x20 * 0x800);
 	save_pointer(NAME(m_low), 0x800);
 	save_item(NAME(m_bank));
 	save_item(NAME(m_reg1001));
-	save_item(NAME(m_ic12));
+	save_item(NAME(m_pcmreg));
+	save_item(NAME(m_keys));
 
 	std::fill(std::begin(m_ddram), std::end(m_ddram), ' ');
 	m_lcd_ready_timer = timer_alloc(FUNC(roland_u220_state::lcd_ready), this);
@@ -143,17 +154,6 @@ void roland_u220_state::note(char what, offs_t addr, u8 data)
 
 
 /**************************************************************************************
-    Program ROM.  0x2000-0x7FFF is fixed; how the other 64 KB reaches the CPU is not
-    known yet, so the upper window shows the lower half's 0x8000-0xFFFF for now.
-**************************************************************************************/
-
-u8 roland_u220_state::rom_hi_r(offs_t offset)
-{
-	return m_progrom[0x8000 + offset];
-}
-
-
-/**************************************************************************************
     Everything below 0x2000 that is not yet understood
 **************************************************************************************/
 
@@ -169,46 +169,68 @@ void roland_u220_state::low_w(offs_t offset, u8 data)
 	m_low[offset] = data;
 }
 
-u8 roland_u220_state::ic12_r(offs_t offset)
-{
-	u8 data = m_ic12[offset];
-	if (offset == 0)
-		data = m_lcd_addr & 0x7f;      // busy flag clear, address counter
-	else if (offset == 1)
-		data = m_ddram[m_lcd_addr & 0x7f];
-	note('R', 0x800 + offset, data);
-	return data;
-}
-
-void roland_u220_state::ic12_w(offs_t offset, u8 data)
-{
-	m_ic12[offset] = data;
-	if (offset == 0)
-	{
-		lcd_shadow_cmd(data);
-		m_lcd_ready_timer->adjust(attotime::from_usec(40));
-		return;
-	}
-	if (offset == 1)
-	{
-		lcd_shadow_data(data);
-		m_lcd_ready_timer->adjust(attotime::from_usec(40));
-		return;
-	}
-	note('W', 0x800 + offset, data);
-}
-
 u8 roland_u220_state::window_r(offs_t offset)
 {
-	const u8 data = m_window[(m_bank << 11) | offset];
-	note('<', 0x820 + offset, data);
+	const u8 sel = m_bank >> 4;
+	u8 data = 0xff;
+	switch (sel)
+	{
+	case 0x0:                                           // PCM chip
+		data = m_pcmreg[offset & 0x1f];
+		note('p', 0x800 + offset, data);
+		break;
+	case 0x1:                                           // LCD
+		data = (offset & 1) ? m_ddram[m_lcd_addr & 0x7f] : (m_lcd_addr & 0x7f);
+		note('l', 0x800 + offset, data);
+		break;
+	case 0x3:                                           // key matrix
+		// Active low: the scan at 0xE1A2 forces the two unused bits of 080D high and
+		// inverts the word, so all ones is "nothing pressed".
+		data = 0xff;
+		note('k', 0x800 + offset, data);
+		break;
+	case 0x4: case 0x5: case 0x6: case 0x7:             // program ROM pages
+		data = m_progrom[((m_bank & 0x3f) << 11) | offset];
+		break;
+	case 0x8: case 0x9:                                 // SRAM pages
+		data = m_window[((m_bank & 0x1f) << 11) | offset];
+		break;
+	default:
+		note('?', 0x800 + offset, data);
+		break;
+	}
 	return data;
 }
 
 void roland_u220_state::window_w(offs_t offset, u8 data)
 {
-	note('>', 0x820 + offset, data);
-	m_window[(m_bank << 11) | offset] = data;
+	const u8 sel = m_bank >> 4;
+	switch (sel)
+	{
+	case 0x0:
+		m_pcmreg[offset & 0x1f] = data;
+		note('P', 0x800 + offset, data);
+		break;
+	case 0x1:
+		if (offset == 0)
+			lcd_shadow_cmd(data);
+		else if (offset == 1)
+			lcd_shadow_data(data);
+		else
+			note('L', 0x800 + offset, data);
+		m_lcd_ready_timer->adjust(attotime::from_usec(40));
+		break;
+	case 0x3:
+		m_keys[offset & 0x1f] = data;
+		note('K', 0x800 + offset, data);
+		break;
+	case 0x8: case 0x9:
+		m_window[((m_bank & 0x1f) << 11) | offset] = data;
+		break;
+	default:
+		note('!', 0x800 + offset, data);
+		break;
+	}
 }
 
 u8 roland_u220_state::bank_r()
@@ -305,13 +327,12 @@ TIMER_CALLBACK_MEMBER(roland_u220_state::lcd_dump)
 void roland_u220_state::mem_map(address_map &map)
 {
 	map(0x0100, 0x07ff).rw(FUNC(roland_u220_state::low_r), FUNC(roland_u220_state::low_w));
-	map(0x0800, 0x081f).rw(FUNC(roland_u220_state::ic12_r), FUNC(roland_u220_state::ic12_w));
-	map(0x0820, 0x0fff).rw(FUNC(roland_u220_state::window_r), FUNC(roland_u220_state::window_w));
+	map(0x0800, 0x0fff).rw(FUNC(roland_u220_state::window_r), FUNC(roland_u220_state::window_w));
 	map(0x1000, 0x1000).rw(FUNC(roland_u220_state::bank_r), FUNC(roland_u220_state::bank_w));
 	map(0x1001, 0x1001).rw(FUNC(roland_u220_state::reg1001_r), FUNC(roland_u220_state::reg1001_w));
 	map(0x1002, 0x1fff).ram().share("ram");
 	map(0x2000, 0x7fff).rom().region("progrom", 0x2000);
-	map(0x8000, 0xffff).r(FUNC(roland_u220_state::rom_hi_r));
+	map(0x8000, 0xffff).rom().region("progrom", 0x8000);
 }
 
 static INPUT_PORTS_START(u220)
