@@ -67,6 +67,9 @@
 #include "bus/midi/midi.h"
 #include "cpu/mcs96/i8x9x.h"
 #include "machine/nvram.h"
+#include "sound/roland_lp.h"
+
+#include "roland_u110_data.h"   // wave ROM descrambling, shared with the U-110
 #include "speaker.h"
 
 #include <set>
@@ -84,12 +87,15 @@ public:
 		, m_progrom(*this, "progrom")
 		, m_nvram(*this, "nvram")
 		, m_keys(*this, "KEYS")
+		, m_pcm(*this, "pcm")
+		, m_pcmrom(*this, "pcm")
 		, m_mdout(*this, "mdout")
 		, m_mdthru(*this, "mdthru")
 	{
 	}
 
 	void u220(machine_config &config) ATTR_COLD;
+	void init_u220() ATTR_COLD;
 
 protected:
 	virtual void machine_start() override ATTR_COLD;
@@ -110,6 +116,9 @@ private:
 	void reg1001_w(u8 data);
 
 	u16 battery_r() { return 0x2a0; }
+
+	u8 pcm_r(offs_t offset);
+	void pcm_w(offs_t offset, u8 data);
 
 	// MIDI: the CPU core takes and gives whole bytes; MAME's ports are bit level
 	void midi_rxd_w(int state);
@@ -132,10 +141,12 @@ private:
 
 	u8 m_bank = 0;
 	u8 m_reg1001 = 0;
-	u8 m_pcmreg[0x20] = {};             // PCM chip registers, until the device is wired
+	u8 m_pcmreg[0x20] = {};             // what the CPU last wrote to each chip register
 	u8 m_effreg[0x80] = {};             // effect processor, until it is understood
 	required_device<nvram_device> m_nvram;
 	required_ioport m_keys;
+	required_device<mb87419_mb87420_device> m_pcm;
+	required_region_ptr<u8> m_pcmrom;
 	required_device<midi_port_device> m_mdout;
 	required_device<midi_port_device> m_mdthru;
 
@@ -336,8 +347,7 @@ u8 roland_u220_state::window_r(offs_t offset)
 		note('e', 0x800 + offset, data);
 		break;
 	case 0x6:                                           // PCM chip
-		data = m_pcmreg[offset & 0x1f];
-		note('p', 0x800 + offset, data);
+		data = pcm_r(offset & 0x1f);
 		break;
 	case 0x8: case 0x9:                                 // EPROM upper half
 		data = m_progrom[0x10000 | ((m_bank & 0x1f) << 11) | offset];
@@ -373,8 +383,7 @@ void roland_u220_state::window_w(offs_t offset, u8 data)
 		note('E', 0x800 + offset, data);
 		break;
 	case 0x6:
-		m_pcmreg[offset & 0x1f] = data;
-		note('P', 0x800 + offset, data);
+		pcm_w(offset & 0x1f, data);
 		break;
 	default:
 		note('!', 0x800 + offset, data);
@@ -390,6 +399,43 @@ u8 roland_u220_state::fixed_r(offs_t offset)
 void roland_u220_state::fixed_w(offs_t offset, u8 data)
 {
 	m_ram[0x7002 + offset] = data;
+}
+
+/**************************************************************************************
+    PCM chip (IC17/IC18, "Roland LP"), as on the U-110 and CM-32P.  The P8098's 8-bit
+    bus reaches its 32 registers one byte each, so unlike the U-110 there is no 16-bit
+    lane juggling: register n is window offset n.
+**************************************************************************************/
+
+u8 roland_u220_state::pcm_r(offs_t offset)
+{
+	switch (offset)
+	{
+	case 0x00:      // the voice whose envelope segment ended (reading acknowledges it)
+	case 0x02:      // 02/03: the status-selected voice's level, see roland_lp.cpp
+	case 0x03:
+		return m_pcm->read(offset);
+
+	case 0x01:
+	{
+		// The CPU has no bus to the wave ROMs: it parks voice 0's phase accumulator at an
+		// address and reads the byte back here.  Same arithmetic as roland_u110.cpp.
+		const u32 phase = m_pcmreg[0x08] | (m_pcmreg[0x09] << 8)
+				| (m_pcmreg[0x0a] << 16) | (m_pcmreg[0x0b] << 24);
+		const u16 bank = m_pcmreg[0x02] | (m_pcmreg[0x03] << 8);
+		const offs_t addr = (((phase >> 14) + PCM_READ_PREFETCH) & 0x3ffff) | ((bank & 0x3c00) << 8);
+		return m_pcmrom[addr & 0x3fffff];
+	}
+
+	default:
+		return m_pcmreg[offset];
+	}
+}
+
+void roland_u220_state::pcm_w(offs_t offset, u8 data)
+{
+	m_pcmreg[offset] = data;
+	m_pcm->write(offset, data);
 }
 
 u8 roland_u220_state::bank_r()
@@ -494,6 +540,18 @@ void roland_u220_state::mem_map(address_map &map)
 	map(0x8000, 0xffff).rom().region("progrom", 0x8000);
 }
 
+void roland_u220_state::init_u220()
+{
+	// The board permutes the address and data lines between the mask ROMs and the
+	// sound chip, exactly as on the U-110; undo it.  A-D are the internal banks; E and F,
+	// which are the SN-U110-08 and -09 cards' contents, sit where the U-110's first two
+	// card slots do -- the layout current MAME gives the U-220 too.
+	static constexpr u32 PLACE[6] = { 0x000000, 0x100000, 0x200000, 0x300000, 0x080000, 0x180000 };
+	const u8 *const src = memregion("pcmorg")->base();
+	for (int rom = 0; rom < 6; rom++)
+		descramble_pcm(&m_pcmrom[PLACE[rom]], &src[rom * CARD_SIZE], CARD_SIZE);
+}
+
 static INPUT_PORTS_START(u220)
 	// Bit n is key code E194[n].  Worked out by pressing each bit on the play screen
 	// (tools/u220_keys.lua) and confirmed by round trips (EDIT then EXIT, and so on).
@@ -530,6 +588,22 @@ void roland_u220_state::u220(machine_config &config)
 
 	SPEAKER(config, "speaker", 2).front();
 
+	// IC17/IC18 on their own 32.768 MHz crystal (X2): 32768000 / 1024 = 32 kHz.
+	MB87419_MB87420(config, m_pcm, 32.768_MHz_XTAL);
+	m_pcm->int_callback().set_inputline(m_maincpu, i8x9x_device::EXTINT_LINE);
+	m_pcm->set_rate_divider(1024);
+	// The wave ROMs are the U-110's (A-D) and two of its cards (E, F), so their samples
+	// are coded the same way: 8-bit float deltas the chip integrates.  roland_u110.cpp.
+	m_pcm->set_pcm_mode(mb87419_mb87420_device::PCM_FLOAT8_DELTA);
+	m_pcm->set_delta_dc_hz(0.0);
+	// The envelope is the firmware's: the chip ramps a level and interrupts when it
+	// arrives (EXTINT, handler 0x22DD), and the CPU writes the next segment.
+	m_pcm->set_env_engine(true);
+	m_pcm->set_env_max_int_hz(32000);
+	// TODO: the U-220's MIX and DIRECT outputs, and its effect processor (IC25)
+	m_pcm->add_route(0, "speaker", 1.0, 0);
+	m_pcm->add_route(1, "speaker", 1.0, 1);
+
 	// MIDI IN (JK1, opto-isolated to RXD), OUT (TXD), THRU (from the same opto output)
 	midi_port_device &mdin(MIDI_PORT(config, "mdin", midiin_slot, "midiin"));
 	mdin.rxd_handler().set(FUNC(roland_u220_state::midi_rxd_w));
@@ -547,18 +621,19 @@ ROM_START(u220)
 	ROM_SYSTEM_BIOS(2, "v100", "Version 1.00")
 	ROMX_LOAD("u-220_roland_1-0-0.ic8", 0x00000, 0x20000, CRC(82abd055) SHA1(e1c6f1ee29cebe8663cb0c6989b8faebb3d841fd), ROM_BIOS(2))
 
-	// Interleaved as in current MAME (roland_u20.cpp): A-D where the U-110 has its four
-	// internal ROMs, E and F (= cards SN-U110-08/09) where its first two card slots are.
-	ROM_REGION(0x400000, "waverom", ROMREGION_ERASE00)
+	// Wave ROMs as dumped (scrambled), A-F; init_u220() places them in "pcm".
+	ROM_REGION(0x300000, "pcmorg", 0)
 	ROM_LOAD("roland-a_r15179892f_mb834000a-20_226-aa.bin", 0x000000, 0x080000, CRC(d5475560) SHA1(55d36199ea489969a729782afe4cbff5b1cede0e)) // IC19
-	ROM_LOAD("roland-e_r15179947_mb834000a-20_3a1-aa.bin",  0x080000, 0x080000, CRC(104f3974) SHA1(71b6f97df6dd4e573db5743c10c77e86d67965a3)) // IC23
-	ROM_LOAD("roland-b_r15179893f_mb834000a-20_227-aa.bin", 0x100000, 0x080000, CRC(43a5b26c) SHA1(8b8067fbc6fa7b2e8694a3785f123627ea458d1f)) // IC20
-	ROM_LOAD("roland-f_r15179948_mb834000a-20_3a2-aa.bin",  0x180000, 0x080000, CRC(af1c2778) SHA1(aea715a0a554c071a2e912894805a8d819802e1d)) // IC24
-	ROM_LOAD("roland-c_r15179894f_mb834000a-20_228-aa.bin", 0x200000, 0x080000, CRC(e79ee88a) SHA1(8dd9826d7d3e67b9a568eadeaaf7856a05f3e068)) // IC21
-	ROM_LOAD("roland-d_r15179895f_mb834000a-20_229-aa.bin", 0x300000, 0x080000, CRC(da9fbf6d) SHA1(35b98a0fb5cf643fb7b761a74581486eee3bd8c3)) // IC22
+	ROM_LOAD("roland-b_r15179893f_mb834000a-20_227-aa.bin", 0x080000, 0x080000, CRC(43a5b26c) SHA1(8b8067fbc6fa7b2e8694a3785f123627ea458d1f)) // IC20
+	ROM_LOAD("roland-c_r15179894f_mb834000a-20_228-aa.bin", 0x100000, 0x080000, CRC(e79ee88a) SHA1(8dd9826d7d3e67b9a568eadeaaf7856a05f3e068)) // IC21
+	ROM_LOAD("roland-d_r15179895f_mb834000a-20_229-aa.bin", 0x180000, 0x080000, CRC(da9fbf6d) SHA1(35b98a0fb5cf643fb7b761a74581486eee3bd8c3)) // IC22
+	ROM_LOAD("roland-e_r15179947_mb834000a-20_3a1-aa.bin",  0x200000, 0x080000, CRC(104f3974) SHA1(71b6f97df6dd4e573db5743c10c77e86d67965a3)) // IC23 = SN-U110-08
+	ROM_LOAD("roland-f_r15179948_mb834000a-20_3a2-aa.bin",  0x280000, 0x080000, CRC(af1c2778) SHA1(aea715a0a554c071a2e912894805a8d819802e1d)) // IC24 = SN-U110-09
+
+	ROM_REGION(0x400000, "pcm", ROMREGION_ERASEFF)          // descrambled, as the chip sees it
 ROM_END
 
 } // anonymous namespace
 
 
-SYST(1989, u220, 0, 0, u220, u220, roland_u220_state, empty_init, "Roland", "U-220 RS-PCM Sound Module", MACHINE_NO_SOUND | MACHINE_NOT_WORKING)
+SYST(1989, u220, 0, 0, u220, u220, roland_u220_state, init_u220, "Roland", "U-220 RS-PCM Sound Module", MACHINE_IMPERFECT_SOUND | MACHINE_NOT_WORKING)
