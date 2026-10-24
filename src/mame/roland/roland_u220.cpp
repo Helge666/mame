@@ -169,6 +169,7 @@ private:
 
 	std::set<std::tuple<char, offs_t, offs_t, u8>> m_seen;
 	const bool m_trace_tg = getenv("U220_TGTRACE") != nullptr;   // every chip register write
+	const offs_t m_watch_pc = getenv("U220_WATCHPC") ? offs_t(strtoul(getenv("U220_WATCHPC"), nullptr, 16)) : 0;
 	const u32 m_mute = getenv("U220_MUTE") ? u32(strtoul(getenv("U220_MUTE"), nullptr, 16)) : 0;
 
 	emu_timer *m_lcd_ready_timer = nullptr;
@@ -332,6 +333,8 @@ u8 roland_u220_state::window_r(offs_t offset)
 	{
 	case 0x0:                                           // SRAM pages
 		data = m_ram[((m_bank & 0x0f) << 11) | offset];
+		if (m_watch_pc && m_maincpu->pc() >= m_watch_pc && m_maincpu->pc() < m_watch_pc + 8)
+			logerror("WATCH %f pc=%04X bank=%02X off=%03X -> %02X\n", machine().time().as_double(), m_maincpu->pc(), m_bank, offset, data);
 		break;
 	case 0x1:                                           // LCD
 		data = (offset & 1) ? m_ddram[m_lcd_addr & 0x7f] : (m_lcd_addr & 0x7f);
