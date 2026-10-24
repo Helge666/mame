@@ -78,6 +78,10 @@
 
 namespace {
 
+using roland_u110::CARD_SIZE;
+using roland_u110::PCM_READ_PREFETCH;
+using roland_u110::descramble_pcm;
+
 class roland_u220_state : public driver_device
 {
 public:
