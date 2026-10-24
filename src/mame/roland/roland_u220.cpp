@@ -341,10 +341,10 @@ void roland_u220_state::u220(machine_config &config)
 	HD44780(config, m_lcd, 270'000);
 	m_lcd->set_lcd_size(2, 24);
 
-	screen_device &screen(SCREEN(config, "screen", SCREEN_TYPE_LCD));
+	screen_device &screen(SCREEN(config, "screen").set_lcd());
 	screen.set_refresh_hz(60);
 	screen.set_size(24 * 6 - 1, 2 * 9 - 1);
-	screen.set_visarea_full();
+	screen.set_visarea(0, 24 * 6 - 2, 0, 2 * 9 - 2);
 	screen.set_screen_update("lcd", FUNC(hd44780_device::screen_update));
 	screen.set_palette("palette");
 	PALETTE(config, "palette", FUNC(roland_u220_state::lcd_palette), 2);
