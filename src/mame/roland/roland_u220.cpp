@@ -176,6 +176,8 @@ private:
 	const u32 m_mute = getenv("U220_MUTE") ? u32(strtoul(getenv("U220_MUTE"), nullptr, 16)) : 0;
 	const u16 m_mute_start = getenv("U220_MUTE_START") ? u16(strtoul(getenv("U220_MUTE_START"), nullptr, 16)) : 0;
 	u16 m_vstart[32] = {};
+	int m_watchw_bank = -1;
+	offs_t m_watchw_from = 0, m_watchw_to = 0;
 
 	emu_timer *m_lcd_ready_timer = nullptr;
 	emu_timer *m_lcd_dump_timer = nullptr;
@@ -201,6 +203,16 @@ void roland_u220_state::machine_start()
 	save_item(NAME(m_pend07_valid));
 
 	std::fill(std::begin(m_ddram), std::end(m_ddram), ' ');
+	if (const char *w = getenv("U220_WATCHW"))
+	{
+		unsigned bk = 0, f = 0, t = 0;
+		if (sscanf(w, "%x:%x:%x", &bk, &f, &t) == 3)
+		{
+			m_watchw_bank = int(bk);
+			m_watchw_from = f;
+			m_watchw_to = t;
+		}
+	}
 	m_midi_rx_timer = timer_alloc(FUNC(roland_u220_state::midi_rx_bit), this);
 	m_midi_tx_timer = timer_alloc(FUNC(roland_u220_state::midi_tx_bit), this);
 	save_item(NAME(m_rxd));
@@ -381,6 +393,9 @@ void roland_u220_state::window_w(offs_t offset, u8 data)
 	{
 	case 0x0:
 		m_ram[((m_bank & 0x0f) << 11) | offset] = data;
+		// U220_WATCHW=bank:from:to (hex, window offsets): log writes there, with the PC
+		if (m_watchw_bank >= 0 && m_bank == m_watchw_bank && offset >= m_watchw_from && offset <= m_watchw_to)
+			logerror("WATCHW %f pc=%04X bank=%02X off=%03X <- %02X\n", machine().time().as_double(), m_maincpu->pc(), m_bank, offset, data);
 		break;
 	case 0x1:
 		if (offset == 0)
