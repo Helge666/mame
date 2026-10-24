@@ -232,8 +232,7 @@ TIMER_CALLBACK_MEMBER(roland_u220_state::midi_rx_bit)
 	else
 	{
 		m_maincpu->serial_w(m_rx_data);
-		logerror("MIDI IN %f %02X
-", machine().time().as_double(), m_rx_data);
+		logerror("MIDI IN %f %02X\n", machine().time().as_double(), m_rx_data);
 		m_rx_bit = -1;
 	}
 }
@@ -243,14 +242,12 @@ void roland_u220_state::midi_tx_w(u16 data)
 	const u8 next = (m_tx_head + 1) % u8(std::size(m_tx_fifo));
 	if (next == m_tx_tail)
 	{
-		logerror("MIDI OUT overrun: %02X dropped
-", data & 0xff);
+		logerror("MIDI OUT overrun: %02X dropped\n", data & 0xff);
 		return;
 	}
 	m_tx_fifo[m_tx_head] = u8(data);
 	m_tx_head = next;
-	logerror("MIDI OUT %f %02X
-", machine().time().as_double(), data & 0xff);
+	logerror("MIDI OUT %f %02X\n", machine().time().as_double(), data & 0xff);
 	if (m_tx_bit < 0)
 		midi_tx_start();
 }
