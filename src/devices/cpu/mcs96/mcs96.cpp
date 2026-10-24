@@ -219,6 +219,12 @@ void mcs96_device::any_w8(u16 adr, u8 data)
 
 void mcs96_device::any_w16(u16 adr, u16 data)
 {
+	if (m_unaligned_ext_words && adr >= 0x100 && (adr & 1))
+	{
+		program->write_byte(adr, data & 0xff);
+		program->write_byte(u16(adr + 1), data >> 8);
+		return;
+	}
 	adr &= 0xfffe;
 	if (adr < 0x100)
 		regs->write_word(adr, data);
@@ -236,9 +242,7 @@ u8 mcs96_device::any_r8(u16 adr)
 
 u16 mcs96_device::any_r16(u16 adr)
 {
-	// EXPERIMENT (U220_UNALIGNED): external word reads at odd addresses, unaligned.
-	static const bool unaligned = getenv("U220_UNALIGNED") != nullptr;
-	if (unaligned && adr >= 0x100 && (adr & 1))
+	if (m_unaligned_ext_words && adr >= 0x100 && (adr & 1))
 		return program->read_byte(adr) | (program->read_byte(u16(adr + 1)) << 8);
 	adr &= 0xfffe;
 	if (adr < 0x100)

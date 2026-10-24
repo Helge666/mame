@@ -15,6 +15,15 @@
 
 class mcs96_device : public cpu_device {
 public:
+	// Word accesses to EXTERNAL memory at an odd address.  By default the address is
+	// forced even, as for the register file.  The Roland U-220 (P8098, 8-bit bus) shows that
+	// on its board the two bytes are fetched from the odd address and the one after it: its
+	// firmware reads a voice's state word at 0x0980[voice] for odd voices too, and with the
+	// address forced even it reads the neighbouring voice's state, re-applies a loop pitch
+	// correction on every pass and audibly bends the release up -- which the real unit does
+	// not do.  roland_u220.cpp turns this on; nothing else changes.
+	void set_unaligned_ext_words(bool on) { m_unaligned_ext_words = on; }
+
 	enum {
 		MCS96_PC = 1,
 		MCS96_PSW,
@@ -219,6 +228,7 @@ protected:
 	O(fetch_noirq);
 
 #undef O
+	bool m_unaligned_ext_words = false;
 };
 
 #endif // MAME_CPU_MCS96_MCS96_H

@@ -661,6 +661,9 @@ void roland_u220_state::u220(machine_config &config)
 {
 	P8098(config, m_maincpu, 12_MHz_XTAL);
 	m_maincpu->set_addrmap(AS_PROGRAM, &roland_u220_state::mem_map);
+	// The firmware reads word-sized per-voice state at odd addresses (0x0980[voice]) and
+	// needs the bytes AT that address, not the even-aligned pair: see mcs96.h.
+	m_maincpu->set_unaligned_ext_words(true);
 	m_maincpu->ach7_cb().set(FUNC(roland_u220_state::battery_r));
 	m_maincpu->serial_tx_cb().set(FUNC(roland_u220_state::midi_tx_w));
 
