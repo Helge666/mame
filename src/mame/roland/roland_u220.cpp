@@ -432,6 +432,9 @@ u8 roland_u220_state::fixed_r(offs_t offset)
 void roland_u220_state::fixed_w(offs_t offset, u8 data)
 {
 	m_ram[0x7002 + offset] = data;
+	// U220_WATCHW=ff:from:to watches the fixed RAM at 0x1002-0x1FFF by CPU address
+	if (m_watchw_bank == 0xff && 0x1002 + offset >= m_watchw_from && 0x1002 + offset <= m_watchw_to)
+		logerror("WATCHW %f pc=%04X fixed %04X <- %02X\n", machine().time().as_double(), m_maincpu->pc(), 0x1002 + offset, data);
 }
 
 /**************************************************************************************
