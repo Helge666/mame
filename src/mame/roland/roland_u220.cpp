@@ -64,6 +64,7 @@
 
 #include "emu.h"
 
+#include "bus/midi/midi.h"
 #include "cpu/mcs96/i8x9x.h"
 #include "machine/nvram.h"
 #include "speaker.h"
@@ -83,6 +84,8 @@ public:
 		, m_progrom(*this, "progrom")
 		, m_nvram(*this, "nvram")
 		, m_keys(*this, "KEYS")
+		, m_mdout(*this, "mdout")
+		, m_mdthru(*this, "mdthru")
 	{
 	}
 
@@ -108,6 +111,13 @@ private:
 
 	u16 battery_r() { return 0x2a0; }
 
+	// MIDI: the CPU core takes and gives whole bytes; MAME's ports are bit level
+	void midi_rxd_w(int state);
+	TIMER_CALLBACK_MEMBER(midi_rx_bit);
+	void midi_tx_w(u16 data);
+	void midi_tx_start();
+	TIMER_CALLBACK_MEMBER(midi_tx_bit);
+
 	TIMER_CALLBACK_MEMBER(lcd_ready);
 	TIMER_CALLBACK_MEMBER(lcd_dump);
 	void lcd_shadow_cmd(u8 data);
@@ -126,6 +136,19 @@ private:
 	u8 m_effreg[0x80] = {};             // effect processor, until it is understood
 	required_device<nvram_device> m_nvram;
 	required_ioport m_keys;
+	required_device<midi_port_device> m_mdout;
+	required_device<midi_port_device> m_mdthru;
+
+	static constexpr u32 MIDI_BAUD = 31250;
+	emu_timer *m_midi_rx_timer = nullptr;
+	emu_timer *m_midi_tx_timer = nullptr;
+	int m_rxd = 1;
+	int m_rx_bit = -1;
+	u8 m_rx_data = 0;
+	u8 m_tx_fifo[16] = {};
+	u8 m_tx_head = 0, m_tx_tail = 0;
+	int m_tx_bit = -1;
+	u8 m_tx_data = 0;
 	std::unique_ptr<u8[]> m_ram;        // IC10, 32 KB, battery backed
 	std::unique_ptr<u8[]> m_low;        // 0x0100-0x07FF, in case it is RAM after all
 
@@ -153,6 +176,17 @@ void roland_u220_state::machine_start()
 	save_item(NAME(m_effreg));
 
 	std::fill(std::begin(m_ddram), std::end(m_ddram), ' ');
+	m_midi_rx_timer = timer_alloc(FUNC(roland_u220_state::midi_rx_bit), this);
+	m_midi_tx_timer = timer_alloc(FUNC(roland_u220_state::midi_tx_bit), this);
+	save_item(NAME(m_rxd));
+	save_item(NAME(m_rx_bit));
+	save_item(NAME(m_rx_data));
+	save_item(NAME(m_tx_fifo));
+	save_item(NAME(m_tx_head));
+	save_item(NAME(m_tx_tail));
+	save_item(NAME(m_tx_bit));
+	save_item(NAME(m_tx_data));
+
 	m_lcd_ready_timer = timer_alloc(FUNC(roland_u220_state::lcd_ready), this);
 	m_lcd_dump_timer = timer_alloc(FUNC(roland_u220_state::lcd_dump), this);
 	m_lcd_dump_timer->adjust(attotime::from_msec(100), 0, attotime::from_msec(100));
@@ -162,6 +196,95 @@ void roland_u220_state::machine_reset()
 {
 	m_bank = 0;
 	m_reg1001 = 0;
+	m_rx_bit = -1;
+	m_tx_bit = -1;
+	m_tx_head = m_tx_tail = 0;
+	m_mdout->write_txd(1);                  // MIDI OUT idles high
+}
+
+
+/**************************************************************************************
+    MIDI, as in roland_u110.cpp: IN is deserialised here (31250 baud 8N1) and handed to
+    the CPU a byte at a time; OUT is serialised from the CPU's bytes; THRU is a wire.
+**************************************************************************************/
+
+void roland_u220_state::midi_rxd_w(int state)
+{
+	m_mdthru->write_txd(state);
+
+	if (m_rx_bit < 0 && m_rxd && !state)
+	{
+		m_rx_bit = 0;
+		m_rx_data = 0;
+		m_midi_rx_timer->adjust(attotime::from_ticks(3, 2 * MIDI_BAUD));   // mid bit 0
+	}
+	m_rxd = state;
+}
+
+TIMER_CALLBACK_MEMBER(roland_u220_state::midi_rx_bit)
+{
+	if (m_rx_bit < 8)
+	{
+		m_rx_data |= m_rxd << m_rx_bit;
+		m_rx_bit++;
+		m_midi_rx_timer->adjust(attotime::from_ticks(1, MIDI_BAUD));
+	}
+	else
+	{
+		m_maincpu->serial_w(m_rx_data);
+		logerror("MIDI IN %f %02X
+", machine().time().as_double(), m_rx_data);
+		m_rx_bit = -1;
+	}
+}
+
+void roland_u220_state::midi_tx_w(u16 data)
+{
+	const u8 next = (m_tx_head + 1) % u8(std::size(m_tx_fifo));
+	if (next == m_tx_tail)
+	{
+		logerror("MIDI OUT overrun: %02X dropped
+", data & 0xff);
+		return;
+	}
+	m_tx_fifo[m_tx_head] = u8(data);
+	m_tx_head = next;
+	logerror("MIDI OUT %f %02X
+", machine().time().as_double(), data & 0xff);
+	if (m_tx_bit < 0)
+		midi_tx_start();
+}
+
+void roland_u220_state::midi_tx_start()
+{
+	if (m_tx_head == m_tx_tail)
+		return;
+	m_tx_data = m_tx_fifo[m_tx_tail];
+	m_tx_tail = (m_tx_tail + 1) % u8(std::size(m_tx_fifo));
+	m_tx_bit = 0;
+	m_mdout->write_txd(0);                  // start bit
+	m_midi_tx_timer->adjust(attotime::from_ticks(1, MIDI_BAUD));
+}
+
+TIMER_CALLBACK_MEMBER(roland_u220_state::midi_tx_bit)
+{
+	if (m_tx_bit < 8)
+	{
+		m_mdout->write_txd(BIT(m_tx_data, m_tx_bit));
+		m_tx_bit++;
+		m_midi_tx_timer->adjust(attotime::from_ticks(1, MIDI_BAUD));
+	}
+	else if (m_tx_bit == 8)
+	{
+		m_mdout->write_txd(1);              // stop bit
+		m_tx_bit++;
+		m_midi_tx_timer->adjust(attotime::from_ticks(1, MIDI_BAUD));
+	}
+	else
+	{
+		m_tx_bit = -1;
+		midi_tx_start();
+	}
 }
 
 void roland_u220_state::note(char what, offs_t addr, u8 data)
@@ -400,6 +523,7 @@ void roland_u220_state::u220(machine_config &config)
 	P8098(config, m_maincpu, 12_MHz_XTAL);
 	m_maincpu->set_addrmap(AS_PROGRAM, &roland_u220_state::mem_map);
 	m_maincpu->ach7_cb().set(FUNC(roland_u220_state::battery_r));
+	m_maincpu->serial_tx_cb().set(FUNC(roland_u220_state::midi_tx_w));
 
 	// IC10, reached through the window (pages 00-0D) and at 0x1000-0x1FFF (0E-0F).
 	NVRAM(config, m_nvram, nvram_device::DEFAULT_ALL_0);
@@ -408,6 +532,12 @@ void roland_u220_state::u220(machine_config &config)
 	// boot work needs the text, not the pixels -- which the shadow above provides.
 
 	SPEAKER(config, "speaker", 2).front();
+
+	// MIDI IN (JK1, opto-isolated to RXD), OUT (TXD), THRU (from the same opto output)
+	midi_port_device &mdin(MIDI_PORT(config, "mdin", midiin_slot, "midiin"));
+	mdin.rxd_handler().set(FUNC(roland_u220_state::midi_rxd_w));
+	MIDI_PORT(config, m_mdout, midiout_slot, "midiout");
+	MIDI_PORT(config, m_mdthru, midiout_slot, "midiout");
 }
 
 
