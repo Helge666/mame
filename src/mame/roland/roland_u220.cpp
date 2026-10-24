@@ -452,7 +452,7 @@ void roland_u220_state::pcm_w(offs_t offset, u8 data)
 		data = 0;
 	m_pcm->write(offset, data);
 	if (m_trace_tg)
-		logerror("TG %f v%02X reg %02X = %02X\n", machine().time().as_double(), m_pcmreg[0x1f] & 0x1f, offset, data);
+		logerror("TG %f v%02X reg %02X = %02X  pc=%04X\n", machine().time().as_double(), m_pcmreg[0x1f] & 0x1f, offset, data, m_maincpu->pc());
 }
 
 u8 roland_u220_state::bank_r()
