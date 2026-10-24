@@ -41,10 +41,6 @@
 #include "emu.h"
 
 #include "cpu/mcs96/i8x9x.h"
-#include "video/hd44780.h"
-
-#include "emupal.h"
-#include "screen.h"
 #include "speaker.h"
 
 #include <set>
@@ -59,7 +55,6 @@ public:
 	roland_u220_state(const machine_config &mconfig, device_type type, const char *tag)
 		: driver_device(mconfig, type, tag)
 		, m_maincpu(*this, "maincpu")
-		, m_lcd(*this, "lcd")
 		, m_progrom(*this, "progrom")
 	{
 	}
@@ -88,7 +83,6 @@ private:
 
 	u16 battery_r() { return 0x2a0; }
 
-	void lcd_palette(palette_device &palette) const ATTR_COLD;
 	TIMER_CALLBACK_MEMBER(lcd_ready);
 	TIMER_CALLBACK_MEMBER(lcd_dump);
 	void lcd_shadow_cmd(u8 data);
@@ -99,7 +93,6 @@ private:
 	void note(char what, offs_t addr, u8 data);
 
 	required_device<i8x9x_device> m_maincpu;
-	required_device<hd44780_device> m_lcd;
 	required_region_ptr<u8> m_progrom;
 
 	u8 m_bank = 0;
@@ -129,6 +122,7 @@ void roland_u220_state::machine_start()
 	save_item(NAME(m_reg1001));
 	save_item(NAME(m_ic12));
 
+	std::fill(std::begin(m_ddram), std::end(m_ddram), ' ');
 	m_lcd_ready_timer = timer_alloc(FUNC(roland_u220_state::lcd_ready), this);
 	m_lcd_dump_timer = timer_alloc(FUNC(roland_u220_state::lcd_dump), this);
 	m_lcd_dump_timer->adjust(attotime::from_msec(100), 0, attotime::from_msec(100));
@@ -179,9 +173,9 @@ u8 roland_u220_state::ic12_r(offs_t offset)
 {
 	u8 data = m_ic12[offset];
 	if (offset == 0)
-		data = m_lcd->control_r();
+		data = m_lcd_addr & 0x7f;      // busy flag clear, address counter
 	else if (offset == 1)
-		data = m_lcd->data_r();
+		data = m_ddram[m_lcd_addr & 0x7f];
 	note('R', 0x800 + offset, data);
 	return data;
 }
@@ -191,14 +185,12 @@ void roland_u220_state::ic12_w(offs_t offset, u8 data)
 	m_ic12[offset] = data;
 	if (offset == 0)
 	{
-		m_lcd->control_w(data);
 		lcd_shadow_cmd(data);
 		m_lcd_ready_timer->adjust(attotime::from_usec(40));
 		return;
 	}
 	if (offset == 1)
 	{
-		m_lcd->data_w(data);
 		lcd_shadow_data(data);
 		m_lcd_ready_timer->adjust(attotime::from_usec(40));
 		return;
@@ -255,7 +247,7 @@ TIMER_CALLBACK_MEMBER(roland_u220_state::lcd_ready)
 	m_maincpu->set_input_line(i8x9x_device::HSI0_LINE, CLEAR_LINE);
 }
 
-// A text copy of the display for headless runs: the HD44780 keeps its DDRAM to itself.
+// A text copy of the display, which is all a headless run needs.
 void roland_u220_state::lcd_shadow_cmd(u8 data)
 {
 	if (data == 0x01)
@@ -306,13 +298,6 @@ TIMER_CALLBACK_MEMBER(roland_u220_state::lcd_dump)
 	}
 }
 
-void roland_u220_state::lcd_palette(palette_device &palette) const
-{
-	palette.set_pen_color(0, rgb_t(0x20, 0x48, 0x10));
-	palette.set_pen_color(1, rgb_t(0xb0, 0xf0, 0x60));
-}
-
-
 /**************************************************************************************
     Memory map
 **************************************************************************************/
@@ -338,16 +323,8 @@ void roland_u220_state::u220(machine_config &config)
 	m_maincpu->set_addrmap(AS_PROGRAM, &roland_u220_state::mem_map);
 	m_maincpu->ach7_cb().set(FUNC(roland_u220_state::battery_r));
 
-	HD44780(config, m_lcd, 270'000);
-	m_lcd->set_lcd_size(2, 24);
-
-	screen_device &screen(SCREEN(config, "screen").set_lcd());
-	screen.set_refresh_hz(60);
-	screen.set_size(24 * 6 - 1, 2 * 9 - 1);
-	screen.set_visarea(0, 24 * 6 - 2, 0, 2 * 9 - 2);
-	screen.set_screen_update("lcd", FUNC(hd44780_device::screen_update));
-	screen.set_palette("palette");
-	PALETTE(config, "palette", FUNC(roland_u220_state::lcd_palette), 2);
+	// No LCD device yet: MAME's HD44780 needs a character ROM nobody has dumped, and the
+	// boot work needs the text, not the pixels -- which the shadow above provides.
 
 	SPEAKER(config, "speaker", 2).front();
 }
