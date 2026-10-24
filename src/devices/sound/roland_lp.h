@@ -42,7 +42,13 @@ public:
 	static constexpr int MAX_GAIN_OUTS = 8;
 	void set_gain_matrix(bool on) { m_gain_matrix = on; }
 	void set_voice_gain(u8 voice, int out, float gain)
-	{ if (voice < NUM_CHANNELS && out >= 0 && out < MAX_GAIN_OUTS) m_voice_gain[voice][out] = gain; }
+	{
+		if (voice >= NUM_CHANNELS || out < 0 || out >= MAX_GAIN_OUTS || m_voice_gain[voice][out] == gain)
+			return;
+		if (m_stream)
+			m_stream->update();         // the new gain applies from this sample on
+		m_voice_gain[voice][out] = gain;
+	}
 
 	// The envelope ramp generator, and the interrupt that drives it.  OFF by default, so
 	// the CM-32P / D-70 / R-8 / U-20 drivers keep the behaviour they were tuned against.
@@ -258,7 +264,7 @@ private:
 
 	uint32_t m_clock;                   // clock
 	uint32_t m_rate;                    // sample rate (usually 32000 Hz)
-	sound_stream* m_stream;             // stream handle
+	sound_stream* m_stream = nullptr;   // stream handle
 	pcm_channel m_chns[NUM_SLOTS];      // channel memory; the last two are the LFO slots
 	uint8_t m_sel_chn;
 	pcm_mode m_pcm_mode = PCM_DIFFERENTIAL;

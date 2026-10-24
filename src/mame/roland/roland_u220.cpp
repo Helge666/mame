@@ -70,6 +70,7 @@
 #include "sound/roland_lp.h"
 
 #include "roland_u110_data.h"   // wave ROM descrambling, shared with the U-110
+#include "roland_u220_ic25.h"   // IC25's voice mixer, shared with the plugin core
 #include "speaker.h"
 
 #include <set>
@@ -149,7 +150,8 @@ private:
 	u8 m_pcmreg[0x20] = {};             // what the CPU last wrote to each chip register
 	u8 m_pend07 = 0;                    // envelope target held back until its rate, see pcm_w()
 	bool m_pend07_valid = false;
-	u8 m_effreg[0x80] = {};             // effect processor, until it is understood
+	u8 m_effreg[0x80] = {};             // effect processor, raw writes
+	roland_u220::ic25_mixer m_ic25;     // its voice mixer: per-voice pan and effect sends
 	required_device<nvram_device> m_nvram;
 	required_ioport m_keys;
 	required_device<mb87419_mb87420_device> m_pcm;
@@ -231,6 +233,10 @@ void roland_u220_state::machine_start()
 
 void roland_u220_state::machine_reset()
 {
+	m_ic25.reset(&m_progrom[0]);
+	for (unsigned v = 0; v < roland_u220::IC25_NUM_VOICES; v++)
+		for (int b = 0; b < roland_u220::NUM_BUSES; b++)
+			m_pcm->set_voice_gain(u8(v), b, 0.0f);
 	m_bank = 0;
 	m_reg1001 = 0;
 	m_rx_bit = -1;
@@ -371,7 +377,7 @@ u8 roland_u220_state::window_r(offs_t offset)
 			note('k', 0x800 + offset, data);
 		break;
 	case 0x4:                                           // effect processor?
-		data = m_effreg[offset & 0x7f];
+		data = m_ic25.read(offset);
 		note('e', 0x800 + offset, data);
 		break;
 	case 0x6:                                           // PCM chip
@@ -411,6 +417,13 @@ void roland_u220_state::window_w(offs_t offset, u8 data)
 		break;
 	case 0x4:
 		m_effreg[offset & 0x7f] = data;
+		if (const int v = m_ic25.write(offset, data); v >= 0)
+		{
+			float g[roland_u220::NUM_BUSES];
+			m_ic25.voice_gains(unsigned(v), g);
+			for (int b = 0; b < roland_u220::NUM_BUSES; b++)
+				m_pcm->set_voice_gain(u8(v), b, g[b]);
+		}
 		note('E', 0x800 + offset, data);
 		break;
 	case 0x6:
@@ -687,9 +700,13 @@ void roland_u220_state::u220(machine_config &config)
 	// arrives (EXTINT, handler 0x22DD), and the CPU writes the next segment.
 	m_pcm->set_env_engine(true);
 	m_pcm->set_env_max_int_hz(32000);
-	// TODO: the U-220's MIX and DIRECT outputs, and its effect processor (IC25)
-	m_pcm->add_route(0, "speaker", 1.0, 0);
-	m_pcm->add_route(1, "speaker", 1.0, 1);
+	// TODO: the U-220's DIRECT outputs
+	// IC25 mixes the voices onto dry/reverb/chorus buses (roland_u220_ic25.h); all three
+	// reach the output.  The reverb and chorus themselves are not emulated yet.
+	m_pcm->set_output_count(roland_u220::NUM_BUSES);
+	m_pcm->set_gain_matrix(true);
+	for (int b = 0; b < roland_u220::NUM_BUSES; b++)
+		m_pcm->add_route(b, "speaker", 1.0, b & 1);
 
 	// MIDI IN (JK1, opto-isolated to RXD), OUT (TXD), THRU (from the same opto output)
 	midi_port_device &mdin(MIDI_PORT(config, "mdin", midiin_slot, "midiin"));
