@@ -168,6 +168,7 @@ private:
 	std::unique_ptr<u8[]> m_low;        // 0x0100-0x07FF, in case it is RAM after all
 
 	std::set<std::tuple<char, offs_t, offs_t, u8>> m_seen;
+	const bool m_trace_tg = getenv("U220_TGTRACE") != nullptr;   // every chip register write
 
 	emu_timer *m_lcd_ready_timer = nullptr;
 	emu_timer *m_lcd_dump_timer = nullptr;
@@ -440,6 +441,8 @@ void roland_u220_state::pcm_w(offs_t offset, u8 data)
 {
 	m_pcmreg[offset] = data;
 	m_pcm->write(offset, data);
+	if (m_trace_tg)
+		logerror("TG %f v%02X reg %02X = %02X\n", machine().time().as_double(), m_pcmreg[0x1f] & 0x1f, offset, data);
 }
 
 u8 roland_u220_state::bank_r()
