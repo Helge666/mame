@@ -123,6 +123,7 @@ private:
 
 	u8 pcm_r(offs_t offset);
 	void pcm_w(offs_t offset, u8 data);
+	void pcm_flush();
 
 	// MIDI: the CPU core takes and gives whole bytes; MAME's ports are bit level
 	void midi_rxd_w(int state);
@@ -146,6 +147,8 @@ private:
 	u8 m_bank = 0;
 	u8 m_reg1001 = 0;
 	u8 m_pcmreg[0x20] = {};             // what the CPU last wrote to each chip register
+	u8 m_pend07 = 0;                    // envelope target held back until its rate, see pcm_w()
+	bool m_pend07_valid = false;
 	u8 m_effreg[0x80] = {};             // effect processor, until it is understood
 	required_device<nvram_device> m_nvram;
 	required_ioport m_keys;
@@ -194,6 +197,8 @@ void roland_u220_state::machine_start()
 	save_item(NAME(m_reg1001));
 	save_item(NAME(m_pcmreg));
 	save_item(NAME(m_effreg));
+	save_item(NAME(m_pend07));
+	save_item(NAME(m_pend07_valid));
 
 	std::fill(std::begin(m_ddram), std::end(m_ddram), ' ');
 	m_midi_rx_timer = timer_alloc(FUNC(roland_u220_state::midi_rx_bit), this);
@@ -422,6 +427,7 @@ void roland_u220_state::fixed_w(offs_t offset, u8 data)
 
 u8 roland_u220_state::pcm_r(offs_t offset)
 {
+	pcm_flush();
 	switch (offset)
 	{
 	case 0x00:      // the voice whose envelope segment ended (reading acknowledges it)
@@ -445,6 +451,17 @@ u8 roland_u220_state::pcm_r(offs_t offset)
 	}
 }
 
+// Deliver a held-back 07: after its 06, or before anything else reaches the chip -- above
+// all a new voice select, which would otherwise send it to the wrong voice.
+void roland_u220_state::pcm_flush()
+{
+	if (m_pend07_valid)
+	{
+		m_pend07_valid = false;
+		m_pcm->write(0x07, m_pend07);
+	}
+}
+
 void roland_u220_state::pcm_w(offs_t offset, u8 data)
 {
 	m_pcmreg[offset] = data;
@@ -461,6 +478,27 @@ void roland_u220_state::pcm_w(offs_t offset, u8 data)
 	}
 	if (offset == 0x07 && m_mute_start && m_vstart[m_pcmreg[0x1f] & 0x1f] == m_mute_start)
 		data = 0;
+
+	// An envelope segment is the pair 06 (rate) / 07 (target), and the device starts the
+	// segment when 07 arrives, using whatever 06 holds.  The U-110 writes the pair as one
+	// 16-bit store, 06 then 07.  This CPU's 8-bit bus does it the other way round -- the
+	// firmware writes 07 and THEN 06 -- so passed through as written, every segment would
+	// run at the PREVIOUS segment's rate.  That is what made releases last seconds: the
+	// key-off segment (target A2, rate C6) ran at the sustain's slow decay rate (EE).
+	// So 07 is held back and delivered after the 06 that follows it.
+	if (offset == 0x07)
+	{
+		m_pend07 = data;
+		m_pend07_valid = true;
+		return;
+	}
+	if (offset == 0x06)
+	{
+		m_pcm->write(0x06, data);
+		pcm_flush();
+		return;
+	}
+	pcm_flush();
 	m_pcm->write(offset, data);
 	if (m_trace_tg)
 		logerror("TG %f v%02X reg %02X = %02X  pc=%04X\n", machine().time().as_double(), m_pcmreg[0x1f] & 0x1f, offset, data, m_maincpu->pc());
