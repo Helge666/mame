@@ -133,7 +133,8 @@ private:
 	u8 m_bank = 0;
 	u8 m_reg1001 = 0;
 	u8 m_pcmreg[0x20] = {};             // PCM chip registers, until the device is wired
-	u8 m_effreg[0x80] = {};             // effect processor, until it is understood
+	u8 m_effreg[0x80] = {};
+	u8 m_ram70[0x800] = {};             // bank 70: what is it?             // effect processor, until it is understood
 	required_device<nvram_device> m_nvram;
 	required_ioport m_keys;
 	required_device<midi_port_device> m_mdout;
@@ -335,6 +336,10 @@ u8 roland_u220_state::window_r(offs_t offset)
 		data = m_effreg[offset & 0x7f];
 		note('e', 0x800 + offset, data);
 		break;
+	case 0x7:                                           // unknown, written and read back
+		data = m_ram70[offset];
+		note('7', 0x800 + offset, data);
+		break;
 	case 0x6:                                           // PCM chip
 		data = m_pcmreg[offset & 0x1f];
 		note('p', 0x800 + offset, data);
@@ -371,6 +376,10 @@ void roland_u220_state::window_w(offs_t offset, u8 data)
 	case 0x4:
 		m_effreg[offset & 0x7f] = data;
 		note('E', 0x800 + offset, data);
+		break;
+	case 0x7:
+		m_ram70[offset] = data;
+		note('8', 0x800 + offset, data);
 		break;
 	case 0x6:
 		m_pcmreg[offset & 0x1f] = data;
