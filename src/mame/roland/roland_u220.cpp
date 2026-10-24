@@ -36,15 +36,26 @@
     So 0x1000/0x1001 are IC12 registers, 0x1002-0x1FFF is RAM, and 0x1000 selects what
     the window at 0x0800-0x0FFF shows -- a device, or a 2 KB page of ROM or RAM:
 
-      0x1000      window 0x0800-0x0FFF                      evidence
-      00-0F       PCM chip, CM-32P register layout          writes to 0811/13/15/17 (voice
-                                                            enable masks), 081F (voice select)
-      10-1F       LCD: 0800 command, 0801 data              the HSI0 handler at 0x2130
-      30-3F       key matrix: 080D, 080E                    the key scan at 0xE1A2
-      40-7F       program ROM, page (bank & 3F) * 2 KB      0x0815 with page 37 is ROM 0x1B815,
-                                                            "Internal Battery Low!", printed
-                                                            from 0x26C0
-      80-9F       SRAM pages                                working value 95, tables at 94/96
+      0x1000      window 0x0800-0x0FFF
+      00-0F       SRAM, page (bank & 0F) * 2 KB              banks 1-4, CD=00, D4=0D cleared at
+                                                            boot through the window
+      10          LCD: 0800 command, 0801 data              the HSI0 handler at 0x2130
+      30          key matrix: 080D, 080E (active low)       the key scan at 0xE1A2
+      40          effect processor (IC25)?                  table entry DE
+      60          PCM chip, CM-32P register layout          table entry DD, used by the chip
+                                                            init at 0x2309 and EXTINT
+      80-9F       EPROM upper half, 0x10000 + (bank & 1F)   DA=97 -> 0x1B800, the message page;
+                  * 2 KB                                    0x8DEC turns a 16-bit data address
+                                                            into bank 80|(a >> 11)
+
+    The firmware keeps these selectors in registers CD-DE, loaded at 0x8DBF from bank 96
+    offset 0x256 -- which is EPROM 0x1B256, so the table documents itself:
+
+      CD=00 CE=01 CF=02 D0=03 D1=04 D2=05 D3=0C D4=0D D5=91 D6=92 D7=93 D8=95 D9=96
+      DA=97 DB=98 DC=99 DD=60 DE=40
+
+    SRAM pages 0E and 0F appear nowhere in it: they are the fixed 0x1000-0x1FFF (with
+    IC12's two registers over the first two bytes), as the 4 KB arithmetic suggests.
 
     There is no code banking: 0x2000-0xFFFF is the lower 64 KB of the EPROM, fixed.  The
     upper 64 KB is data, read through the window.
@@ -54,6 +65,7 @@
 #include "emu.h"
 
 #include "cpu/mcs96/i8x9x.h"
+#include "machine/nvram.h"
 #include "speaker.h"
 
 #include <set>
@@ -69,6 +81,7 @@ public:
 		: driver_device(mconfig, type, tag)
 		, m_maincpu(*this, "maincpu")
 		, m_progrom(*this, "progrom")
+		, m_nvram(*this, "nvram")
 	{
 	}
 
@@ -84,6 +97,8 @@ private:
 	u8 low_r(offs_t offset);
 	void low_w(offs_t offset, u8 data);
 	u8 window_r(offs_t offset);
+	u8 fixed_r(offs_t offset);
+	void fixed_w(offs_t offset, u8 data);
 	void window_w(offs_t offset, u8 data);
 	u8 bank_r();
 	void bank_w(u8 data);
@@ -107,8 +122,9 @@ private:
 	u8 m_bank = 0;
 	u8 m_reg1001 = 0;
 	u8 m_pcmreg[0x20] = {};             // PCM chip registers, until the device is wired
-	u8 m_keys[0x20] = {};
-	std::unique_ptr<u8[]> m_window;     // SRAM pages 80-9F, 32 x 2 KB until the size is known
+	u8 m_effreg[0x80] = {};             // effect processor, until it is understood
+	required_device<nvram_device> m_nvram;
+	std::unique_ptr<u8[]> m_ram;        // IC10, 32 KB, battery backed
 	std::unique_ptr<u8[]> m_low;        // 0x0100-0x07FF, in case it is RAM after all
 
 	std::set<std::tuple<char, offs_t, offs_t, u8>> m_seen;
@@ -124,14 +140,15 @@ private:
 
 void roland_u220_state::machine_start()
 {
-	m_window = std::make_unique<u8[]>(0x20 * 0x800);
 	m_low = std::make_unique<u8[]>(0x800);
-	save_pointer(NAME(m_window), 0x20 * 0x800);
+	m_ram = std::make_unique<u8[]>(0x8000);
+	m_nvram->set_base(m_ram.get(), 0x8000);
+	save_pointer(NAME(m_ram), 0x8000);
 	save_pointer(NAME(m_low), 0x800);
 	save_item(NAME(m_bank));
 	save_item(NAME(m_reg1001));
 	save_item(NAME(m_pcmreg));
-	save_item(NAME(m_keys));
+	save_item(NAME(m_effreg));
 
 	std::fill(std::begin(m_ddram), std::end(m_ddram), ' ');
 	m_lcd_ready_timer = timer_alloc(FUNC(roland_u220_state::lcd_ready), this);
@@ -171,13 +188,11 @@ void roland_u220_state::low_w(offs_t offset, u8 data)
 
 u8 roland_u220_state::window_r(offs_t offset)
 {
-	const u8 sel = m_bank >> 4;
 	u8 data = 0xff;
-	switch (sel)
+	switch (m_bank >> 4)
 	{
-	case 0x0:                                           // PCM chip
-		data = m_pcmreg[offset & 0x1f];
-		note('p', 0x800 + offset, data);
+	case 0x0:                                           // SRAM pages
+		data = m_ram[((m_bank & 0x0f) << 11) | offset];
 		break;
 	case 0x1:                                           // LCD
 		data = (offset & 1) ? m_ddram[m_lcd_addr & 0x7f] : (m_lcd_addr & 0x7f);
@@ -189,11 +204,16 @@ u8 roland_u220_state::window_r(offs_t offset)
 		data = 0xff;
 		note('k', 0x800 + offset, data);
 		break;
-	case 0x4: case 0x5: case 0x6: case 0x7:             // program ROM pages
-		data = m_progrom[((m_bank & 0x3f) << 11) | offset];
+	case 0x4:                                           // effect processor?
+		data = m_effreg[offset & 0x7f];
+		note('e', 0x800 + offset, data);
 		break;
-	case 0x8: case 0x9:                                 // SRAM pages
-		data = m_window[((m_bank & 0x1f) << 11) | offset];
+	case 0x6:                                           // PCM chip
+		data = m_pcmreg[offset & 0x1f];
+		note('p', 0x800 + offset, data);
+		break;
+	case 0x8: case 0x9:                                 // EPROM upper half
+		data = m_progrom[0x10000 | ((m_bank & 0x1f) << 11) | offset];
 		break;
 	default:
 		note('?', 0x800 + offset, data);
@@ -204,12 +224,10 @@ u8 roland_u220_state::window_r(offs_t offset)
 
 void roland_u220_state::window_w(offs_t offset, u8 data)
 {
-	const u8 sel = m_bank >> 4;
-	switch (sel)
+	switch (m_bank >> 4)
 	{
 	case 0x0:
-		m_pcmreg[offset & 0x1f] = data;
-		note('P', 0x800 + offset, data);
+		m_ram[((m_bank & 0x0f) << 11) | offset] = data;
 		break;
 	case 0x1:
 		if (offset == 0)
@@ -221,16 +239,30 @@ void roland_u220_state::window_w(offs_t offset, u8 data)
 		m_lcd_ready_timer->adjust(attotime::from_usec(40));
 		break;
 	case 0x3:
-		m_keys[offset & 0x1f] = data;
 		note('K', 0x800 + offset, data);
 		break;
-	case 0x8: case 0x9:
-		m_window[((m_bank & 0x1f) << 11) | offset] = data;
+	case 0x4:
+		m_effreg[offset & 0x7f] = data;
+		note('E', 0x800 + offset, data);
+		break;
+	case 0x6:
+		m_pcmreg[offset & 0x1f] = data;
+		note('P', 0x800 + offset, data);
 		break;
 	default:
 		note('!', 0x800 + offset, data);
 		break;
 	}
+}
+
+u8 roland_u220_state::fixed_r(offs_t offset)
+{
+	return m_ram[0x7002 + offset];
+}
+
+void roland_u220_state::fixed_w(offs_t offset, u8 data)
+{
+	m_ram[0x7002 + offset] = data;
 }
 
 u8 roland_u220_state::bank_r()
@@ -330,7 +362,7 @@ void roland_u220_state::mem_map(address_map &map)
 	map(0x0800, 0x0fff).rw(FUNC(roland_u220_state::window_r), FUNC(roland_u220_state::window_w));
 	map(0x1000, 0x1000).rw(FUNC(roland_u220_state::bank_r), FUNC(roland_u220_state::bank_w));
 	map(0x1001, 0x1001).rw(FUNC(roland_u220_state::reg1001_r), FUNC(roland_u220_state::reg1001_w));
-	map(0x1002, 0x1fff).ram().share("ram");
+	map(0x1002, 0x1fff).rw(FUNC(roland_u220_state::fixed_r), FUNC(roland_u220_state::fixed_w));
 	map(0x2000, 0x7fff).rom().region("progrom", 0x2000);
 	map(0x8000, 0xffff).rom().region("progrom", 0x8000);
 }
@@ -343,6 +375,9 @@ void roland_u220_state::u220(machine_config &config)
 	P8098(config, m_maincpu, 12_MHz_XTAL);
 	m_maincpu->set_addrmap(AS_PROGRAM, &roland_u220_state::mem_map);
 	m_maincpu->ach7_cb().set(FUNC(roland_u220_state::battery_r));
+
+	// IC10, reached through the window (pages 00-0D) and at 0x1000-0x1FFF (0E-0F).
+	NVRAM(config, m_nvram, nvram_device::DEFAULT_ALL_0);
 
 	// No LCD device yet: MAME's HD44780 needs a character ROM nobody has dumped, and the
 	// boot work needs the text, not the pixels -- which the shadow above provides.
