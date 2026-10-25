@@ -64,12 +64,22 @@ public:
 		std::memset(m_prog, 0, sizeof(m_prog));
 		std::memset(m_data, 0, sizeof(m_data));
 		std::memset(m_owner, 0xff, sizeof(m_owner));
+		// Six program addresses per voice.  The firmware writes a side's gain into the
+		// word at entry 0 (left) / 1 (right), then sets its destination by read-modify-
+		// write of the word at entry 3 / 5.  For most voices those are the same word;
+		// for voices 7, 9, 11, 13 and 20 they are not (v20: a7 a4 a9 a7 a6 a3), and
+		// reading gain and destination from one word left v20 silent on the right --
+		// fast snares jumping to the left in Ostrich, never on the unit.  So the gain is
+		// taken from the one word and the destination from the other.
 		for (unsigned v = 0; v < IC25_NUM_VOICES; v ++)
 		{
-			m_left[v]  = progrom[IC25_VOICE_TABLE + v * 6 + 0];
-			m_right[v] = progrom[IC25_VOICE_TABLE + v * 6 + 1];
-			m_owner[m_left[v]] = uint8_t(v);
-			m_owner[m_right[v]] = uint8_t(v);
+			const uint8_t *e = progrom + IC25_VOICE_TABLE + v * 6;
+			m_gain[v][0] = e[0];
+			m_gain[v][1] = e[1];
+			m_dest[v][0] = e[3];
+			m_dest[v][1] = e[5];
+			for (int k : { 0, 1, 3, 5 })
+				m_owner[e[k]] = uint8_t(v);
 		}
 	}
 
@@ -107,8 +117,8 @@ public:
 	{
 		for (int b = 0; b < NUM_BUSES; b ++)
 			gains[b] = 0.0f;
-		route(m_prog[m_left[v]], 0, gains);
-		route(m_prog[m_right[v]], 1, gains);
+		for (int side = 0; side < 2; side ++)
+			route((m_prog[m_dest[v][side]] & ~0xffu) | (m_prog[m_gain[v][side]] & 0xffu), side, gains);
 	}
 
 	uint32_t program(unsigned a) const { return m_prog[a & 0xff]; }
@@ -134,7 +144,7 @@ private:
 	uint8_t  m_latch[3];
 	uint32_t m_prog[256];
 	uint32_t m_data[32];
-	uint8_t  m_left[IC25_NUM_VOICES], m_right[IC25_NUM_VOICES];
+	uint8_t  m_gain[IC25_NUM_VOICES][2], m_dest[IC25_NUM_VOICES][2];   // program addresses
 	uint8_t  m_owner[256];
 };
 
