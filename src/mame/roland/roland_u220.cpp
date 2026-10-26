@@ -4,7 +4,7 @@
 
     Roland U-220 RS-PCM Sound Module (1989)
 
-    Work in progress, Phase 1 of Ostrich (github: none yet): get the firmware to boot.
+    Ostrich 220: the U-220 driver (analysis/U220-HARDWARE.md has what is known).
     This revision is INSTRUMENTED: it logs what the firmware does to the parts of the
     machine that are not yet understood, so that the memory map can be read off a run.
 
