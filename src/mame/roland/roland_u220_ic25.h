@@ -24,7 +24,7 @@
     byte (routines 0xBC4B and on):
 
       destination 0x1E/0x1F  dry          0x12/0x13  reverb     0x14/0x15  chorus
-                  0x18-0x1B  direct outs (taken as dry here)
+                  0x18/0x19  DIRECT OUT 1 0x1A/0x1B  DIRECT OUT 2
 
     -- the part's "Output Asgn" (Dry/Rev/Cho) and its pan, read off the emulated menus.
     The gains are linear: the hi-hat's 2B/3F and the high tom's 1E/47 come out 3.7 and
@@ -46,8 +46,11 @@
 
 namespace roland_u220 {
 
-/// Buses the mixer feeds, as outputs of the tone generator's gain matrix.
-enum : int { BUS_DRY_L = 0, BUS_DRY_R, BUS_REV_L, BUS_REV_R, BUS_CHO_L, BUS_CHO_R, NUM_BUSES };
+/// Buses the mixer feeds, as outputs of the tone generator's gain matrix.  The direct buses
+/// reach the DIRECT OUT jacks, without effect; with nothing plugged in there the unit sends
+/// them to MIX OUT instead (Owner's Manual p. 27).
+enum : int { BUS_DRY_L = 0, BUS_DRY_R, BUS_REV_L, BUS_REV_R, BUS_CHO_L, BUS_CHO_R,
+		BUS_DIR1_L, BUS_DIR1_R, BUS_DIR2_L, BUS_DIR2_R, NUM_BUSES };
 
 constexpr uint32_t IC25_PROGRAM_ROM   = 0x1a000;   // 256 x 3 bytes, high byte first
 constexpr uint32_t IC25_VOICE_TABLE   = 0x1803e;   // 32 x 6 bytes of program addresses
@@ -118,10 +121,16 @@ public:
 		for (int b = 0; b < NUM_BUSES; b ++)
 			gains[b] = 0.0f;
 		for (int side = 0; side < 2; side ++)
-			route((m_prog[m_dest[v][side]] & ~0xffu) | (m_prog[m_gain[v][side]] & 0xffu), side, gains);
+			route(voice_word(v, side), side, gains);
 	}
 
 	uint32_t program(unsigned a) const { return m_prog[a & 0xff]; }
+
+	/// The word that routes voice `v`'s side (0 left, 1 right): destination and gain.
+	uint32_t voice_word(unsigned v, int side) const
+	{
+		return (m_prog[m_dest[v][side]] & ~0xffu) | (m_prog[m_gain[v][side]] & 0xffu);
+	}
 
 private:
 	uint32_t word() const { return uint32_t(m_latch[0]) << 16 | uint32_t(m_latch[1]) << 8 | m_latch[2]; }
@@ -135,7 +144,9 @@ private:
 		{
 		case 0x12: bus = BUS_REV_L; break;
 		case 0x14: bus = BUS_CHO_L; break;
-		case 0x18: case 0x1a: case 0x1e: bus = BUS_DRY_L; break;
+		case 0x18: bus = BUS_DIR1_L; break;
+		case 0x1a: bus = BUS_DIR2_L; break;
+		case 0x1e: bus = BUS_DRY_L; break;
 		default: return;                 // not a mixer word (yet): the voice is silent
 		}
 		gains[bus + side] += g;

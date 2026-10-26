@@ -39,7 +39,7 @@ public:
 	// own gain for k.  The U-220 needs it -- its effect processor (IC25) pans each voice and
 	// sends it to the dry, reverb or chorus bus by coefficients the CPU rewrites at every
 	// note -- and it overrides the masks and the U-110 effect stage while it is on.
-	static constexpr int MAX_GAIN_OUTS = 8;
+	static constexpr int MAX_GAIN_OUTS = 10;   // the U-220: dry, reverb, chorus, two direct pairs
 	void set_gain_matrix(bool on) { m_gain_matrix = on; }
 	void set_voice_gain(u8 voice, int out, float gain)
 	{
