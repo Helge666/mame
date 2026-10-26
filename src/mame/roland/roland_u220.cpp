@@ -64,6 +64,8 @@
 
 #include "emu.h"
 
+#include "bus/generic/carts.h"
+#include "bus/generic/slot.h"
 #include "bus/midi/midi.h"
 #include "cpu/mcs96/i8x9x.h"
 #include "machine/nvram.h"
@@ -71,8 +73,10 @@
 
 #include "roland_u110_data.h"   // wave ROM descrambling, shared with the U-110
 #include "roland_u220_ic25.h"   // IC25's voice mixer, shared with the plugin core
+#include "softlist_dev.h"
 #include "speaker.h"
 
+#include <bit>
 #include <set>
 #include <tuple>
 
@@ -96,6 +100,7 @@ public:
 		, m_pcmrom(*this, "pcm")
 		, m_mdout(*this, "mdout")
 		, m_mdthru(*this, "mdthru")
+		, m_cards(*this, "cardslot%u", 1U)
 	{
 	}
 
@@ -158,6 +163,12 @@ private:
 	required_region_ptr<u8> m_pcmrom;
 	required_device<midi_port_device> m_mdout;
 	required_device<midi_port_device> m_mdthru;
+	required_device_array<generic_slot_device, 2> m_cards;
+
+	// The two PCM card slots.  A card's detect line is a key-matrix bit (see window_r).
+	template <unsigned Slot> DECLARE_DEVICE_IMAGE_LOAD_MEMBER(card_load);
+	template <unsigned Slot> DECLARE_DEVICE_IMAGE_UNLOAD_MEMBER(card_unload);
+	u8 m_card_present = 0;          // bit per slot, 1 = a card in it
 
 	static constexpr u32 MIDI_BAUD = 31250;
 	emu_timer *m_midi_rx_timer = nullptr;
@@ -198,6 +209,7 @@ void roland_u220_state::machine_start()
 	save_pointer(NAME(m_ram), 0x8000);
 	save_pointer(NAME(m_low), 0x800);
 	save_item(NAME(m_bank));
+	save_item(NAME(m_card_present));
 	save_item(NAME(m_reg1001));
 	save_item(NAME(m_pcmreg));
 	save_item(NAME(m_effreg));
@@ -369,8 +381,11 @@ u8 roland_u220_state::window_r(offs_t offset)
 		// Active low, 14 bits: 080E is bits 0-7, 080D bits 8-13 (the scan at 0xE1A2 sets
 		// the top two itself and inverts the word).  Bit n becomes key code
 		// E194[n]: 6A-6F, 76, 77, 52-57.
+		// Bits 6 and 7 of the first byte are no keys but the PCM card slots' detect lines,
+		// low with a card in: the 8098 has no PORT1, where the U-110 has them.  The firmware
+		// scans them with the keys and on a change reads the card's header (0x91EC).
 		if (offset == 0x0e)
-			data = m_keys->read() & 0xff;
+			data = (m_keys->read() & 0xff) & ~(m_card_present << 6);
 		else if (offset == 0x0d)
 			data = (m_keys->read() >> 8) | 0xc0;
 		else
@@ -649,10 +664,51 @@ void roland_u220_state::init_u220()
 		descramble_pcm(&m_pcmrom[PLACE[rom]], &src[rom * CARD_SIZE], CARD_SIZE);
 }
 
+/**************************************************************************************
+    PCM cards -- SN-U110, as on the U-110.  Slot 1 sits at 0x280000 and slot 2 at
+    0x380000 of the descrambled PCM space: the U-110's card slots 3 and 4 (E and F hold
+    its first two).  A card may go in or out while the machine runs; the firmware shows
+    "Checking PCM Card...".
+**************************************************************************************/
+
+template <unsigned Slot>
+DEVICE_IMAGE_LOAD_MEMBER(roland_u220_state::card_load)
+{
+	u32 const size = m_cards[Slot]->common_get_size("rom");
+	if (size > 0x80000)
+		return std::make_pair(image_error::INVALIDLENGTH, "Invalid size (maximum supported is 512K)");
+
+	m_cards[Slot]->rom_alloc(0x80000, GENERIC_ROM8_WIDTH, ENDIANNESS_LITTLE);
+	m_cards[Slot]->common_load_rom(m_cards[Slot]->get_rom_base(), size, "rom");
+
+	u8 *const base = m_cards[Slot]->get_rom_base();
+	if (size < 0x80000)
+	{
+		// Undersized dumps are mirrored up, in 128K pages at least (roland_u110.cpp).
+		u32 mirror = std::bit_floor(size);
+		if (mirror < 0x20000)
+			mirror = 0x20000;
+		for (u32 ofs = mirror; ofs < 0x80000; ofs += mirror)
+			memcpy(base + ofs, base, mirror);
+	}
+
+	descramble_pcm(&m_pcmrom[0x280000 + Slot * 0x100000], base, CARD_SIZE);
+	m_card_present |= 1 << Slot;
+
+	return std::make_pair(std::error_condition(), std::string());
+}
+
+template <unsigned Slot>
+DEVICE_IMAGE_UNLOAD_MEMBER(roland_u220_state::card_unload)
+{
+	memset(&m_pcmrom[0x280000 + Slot * 0x100000], 0xff, 0x80000);
+	m_card_present &= ~(1 << Slot);
+}
+
 static INPUT_PORTS_START(u220)
 	// Bit n is key code E194[n].  Worked out by pressing each bit on the play screen
 	// (tools/u220_keys.lua) and confirmed by round trips (EDIT then EXIT, and so on).
-	// Bits 6 and 7 do nothing on the U-220; the matrix has room for 14, the panel has 12.
+	// Bits 6 and 7 are the PCM card slots' detect lines, not keys (window_r).
 	PORT_START("KEYS")
 	PORT_BIT(0x0001, IP_ACTIVE_LOW, IPT_KEYPAD) PORT_NAME("Edit")            PORT_CODE(KEYCODE_E)
 	PORT_BIT(0x0002, IP_ACTIVE_LOW, IPT_KEYPAD) PORT_NAME("Data")            PORT_CODE(KEYCODE_D)
@@ -707,6 +763,14 @@ void roland_u220_state::u220(machine_config &config)
 	m_pcm->set_gain_matrix(true);
 	for (int b = 0; b < roland_u220::NUM_BUSES; b++)
 		m_pcm->add_route(b, "speaker", 1.0, b & 1);
+
+	GENERIC_CARTSLOT(config, m_cards[0], generic_romram_plain_slot, "u110_card", "bin")
+			.set_device_load(FUNC(roland_u220_state::card_load<0>));
+	m_cards[0]->set_device_unload(FUNC(roland_u220_state::card_unload<0>));
+	GENERIC_CARTSLOT(config, m_cards[1], generic_romram_plain_slot, "u110_card", "bin")
+			.set_device_load(FUNC(roland_u220_state::card_load<1>));
+	m_cards[1]->set_device_unload(FUNC(roland_u220_state::card_unload<1>));
+	SOFTWARE_LIST(config, "card_list").set_original("u110_card");
 
 	// MIDI IN (JK1, opto-isolated to RXD), OUT (TXD), THRU (from the same opto output)
 	midi_port_device &mdin(MIDI_PORT(config, "mdin", midiin_slot, "midiin"));
